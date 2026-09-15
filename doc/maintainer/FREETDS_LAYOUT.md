@@ -54,8 +54,8 @@ is unmodified upstream, so nothing should differ.
 | macOS and iOS | `darwin/mssql_native/Frameworks` |
 | Android | `android/src/main/jniLibs` |
 
-Desktop native assets are prepared by `hook/build.dart` during supported Dart
-and Flutter builds. Android and iOS use their packaged plugin artifacts.
+`hook/build.dart` prepares native assets during supported Dart and Flutter
+builds, including Android and iOS.
 
 ## Maintainer rebuilds
 

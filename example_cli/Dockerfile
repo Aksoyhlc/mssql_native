@@ -4,7 +4,7 @@ FROM dart:3.10 AS runtimelibs
 RUN mkdir -p /runtime/tmp && chmod 1777 /runtime/tmp
 
 # The compiler is installed in the builder only; the hook invokes it.
-FROM ghcr.io/cirruslabs/flutter:3.41.9 AS build
+FROM dart:3.10 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

@@ -1,15 +1,13 @@
 Pod::Spec.new do |s|
   s.name             = 'mssql_native'
-  s.version          = '0.0.1'
+  s.version          = '0.0.2'
   s.summary          = 'FreeTDS DB-Library and error handlers for the mssql_native Dart driver.'
   s.description      = <<-DESC
 Ships FreeTDS DB-Library and a small C library that owns its global error handlers. The SQL Server driver itself is Dart, calling both through dart:ffi.
                        DESC
-  # No public repository URL is recorded for this package yet. `publish_to` is
-  # none in pubspec.yaml, and this pod is consumed from the local path above,
-  # so the field is a placeholder rather than a location: keep it obviously
-  # unresolvable instead of naming a repository that does not exist.
-  s.homepage         = 'https://localhost/mssql_native'
+  # Flutter builds use the package build hook. Keep the podspec for maintainers
+  # who embed the same XCFrameworks through CocoaPods directly.
+  s.homepage         = 'https://github.com/Aksoyhlc/mssql_native'
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Aksoyhlc' => 'aksoyhlc@gmail.com' }
   s.source           = { :path => '.' }

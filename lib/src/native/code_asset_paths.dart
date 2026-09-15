@@ -17,7 +17,7 @@ external Pointer<Utf8> _dbVersion();
 )
 external int _handlersAbi();
 
-({String sybdb, String handlers}) desktopCodeAssetPaths() {
+({String sybdb, String handlers}) bundledCodeAssetPaths() {
   // Load FreeTDS before the handler that depends on it. Keep its SONAME
   // resident so native dependency lookup and Dart workers use the same copy.
   final sybdb = _modulePath(
@@ -30,6 +30,20 @@ external int _handlersAbi();
     Native.addressOf<NativeFunction<Int32 Function()>>(_handlersAbi).cast(),
   );
   return (sybdb: sybdb, handlers: handlers);
+}
+
+void verifyAndroidCodeAssets() {
+  // Android's loader resolves the bundled libraries by soname. Resolving both
+  // anchors here also keeps their asset IDs reachable in an AOT application.
+  final sybdb = Native.addressOf<NativeFunction<Pointer<Utf8> Function()>>(
+    _dbVersion,
+  );
+  final handlers = Native.addressOf<NativeFunction<Int32 Function()>>(
+    _handlersAbi,
+  );
+  if (sybdb.address == 0 || handlers.address == 0) {
+    throw StateError('Could not resolve the Android mssql_native code assets.');
+  }
 }
 
 String _modulePath(Pointer<Void> symbol) =>

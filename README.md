@@ -63,7 +63,7 @@ part of the SQL text.
 
 ## Requirements
 
-- Dart 3.10 or later, from a Flutter SDK 3.10 or later — see below
+- Dart 3.10 or later; Flutter 3.38 or later for Flutter applications
 - SQL Server 2008 or later, or Azure SQL
 - One of the supported targets listed under [Platform support](#platform-support)
 
@@ -71,32 +71,21 @@ A server older than SQL Server 2016 that never received the TLS 1.2 update
 needs one extra line at startup; see
 [Old servers](#old-servers).
 
-**A Flutter SDK has to be installed where you resolve dependencies, even for
-a pure Dart program.** This package is also a Flutter plugin — that is what
-packages the Android and iOS native libraries into an application — and pub
-requires the Flutter SDK to be present for any package that declares one. In
-practice that means the `dart` on your PATH should be the one inside a Flutter
-install, which is the normal result of installing Flutter; a standalone Dart
-SDK, a plain `dart:` Docker image or `dart-lang/setup-dart` in CI cannot run
-`dart pub get` on it.
-
-It is a build-time requirement and nothing more. The library imports no
-Flutter packages, runs in a plain Dart process, and nothing about Flutter
-reaches what you ship: a `dart build cli` bundle, an APK or an executable
-needs no Flutter on the machine that runs it. [`example_cli`](example_cli/)
-builds inside a Flutter image and deploys `FROM scratch`.
+The package uses a build hook to bundle its native libraries in Dart and
+Flutter applications. A standalone Dart SDK can resolve the package for a
+server or CLI; Flutter applications use the same Dart API and import path.
+The runtime does not import Flutter libraries.
 
 ## Install
 
 ```yaml
 dependencies:
-  mssql_native: ^0.0.1
+  mssql_native: ^0.0.2
 ```
 
-Desktop targets prepare their native assets through the package's build hook
-during `dart run`, `dart build cli` and Flutter builds. Android and iOS use
-the packaged Flutter plugin artifacts. There is no separate build step and
-nothing to configure.
+The build hook packages the native libraries during `dart run`,
+`dart build cli` and Flutter builds, including Android and iOS. There is no
+separate build step and nothing to configure.
 
 ## Getting started
 
@@ -686,7 +675,7 @@ dart build cli --target=bin/main.dart --output=build/release
 ```
 
 **Docker.** The CLI example includes a Dockerfile. It resolves and builds in a
-Flutter image, then copies the bundle into a `FROM scratch` image with the
+Dart image, then copies the bundle into a `FROM scratch` image with the
 Dart runtime filesystem and glibc's gconv converters — the driver runs every
 string through iconv, which loads those at runtime:
 

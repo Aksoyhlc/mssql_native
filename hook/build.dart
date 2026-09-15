@@ -1,6 +1,7 @@
 import 'package:code_assets/code_assets.dart';
 import 'package:hooks/hooks.dart';
 import 'package:mssql_native/src/hook/desktop.dart';
+import 'package:mssql_native/src/hook/mobile.dart';
 
 Future<void> main(List<String> args) async {
   await build(args, (input, output) async {
@@ -19,9 +20,7 @@ Future<void> main(List<String> args) async {
       );
     }
     if (os == OS.android || os == OS.iOS) {
-      // Gradle/CocoaPods/SPM still own the mobile files. Native anchors in
-      // the desktop loader are never called on these platforms.
-      registerUnusedAnchors(input, output);
+      await prepareMobile(input, output);
       return;
     }
     await prepareDesktop(input, output);

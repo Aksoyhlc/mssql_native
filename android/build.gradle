@@ -1,8 +1,6 @@
-// The Android side of an FFI plugin: no Kotlin, no Java, no platform channel.
-//
-// Its entire job is to make Gradle put the prebuilt .so files from
-// src/main/jniLibs/<abi>/ into the APK, where Android's loader finds them by
-// bare name. The driver itself is Dart and reaches them through dart:ffi.
+// Retained for applications that integrate the prebuilt libraries manually.
+// Normal Flutter builds package these .so files through hook/build.dart.
+// The driver itself is Dart and reaches them through dart:ffi.
 group = 'com.aksoyhlc.mssql_native'
 version = '1.0'
 

@@ -69,8 +69,8 @@ frameworks, rewrites install names and rpaths, and applies an ad-hoc signature
 to the generated dylibs. Flutter or Xcode applies final application signing.
 
 Source macOS frameworks use versioned bundle paths; iOS frameworks use flat
-bundle paths. `MssqlNativeBridge` avoids colliding with the Flutter plugin's
-own module name.
+bundle paths. `MssqlNativeBridge` remains the iOS handler framework name so
+the runtime loader resolves the same path after hook packaging.
 
 ## Application configuration
 

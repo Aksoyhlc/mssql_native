@@ -5,6 +5,7 @@ build/
 **/.dart_tool/
 **/.swiftpm/
 .packages
+pubspec.lock
 .pub/
 .flutter-plugins
 .flutter-plugins-dependencies

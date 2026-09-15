@@ -1,7 +1,8 @@
 # Building for Android
 
 Normal Flutter applications use the committed native libraries under
-`android/src/main/jniLibs/<abi>/`. Gradle packages them automatically.
+`android/src/main/jniLibs/<abi>/`. The build hook stages them for Flutter's
+native-asset bundler.
 
 | ABI | Minimum API | Files |
 |---|---:|---|

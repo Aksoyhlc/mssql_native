@@ -63,10 +63,9 @@ connection's setting would leak into other isolates.
 
 ## Loading model
 
-Desktop integration is `hook/build.dart`, which stages the packaged native
-libraries for the target OS/architecture. Android and iOS register the Dart
-anchors while Gradle and the Apple plugin packaging own the actual native
-files.
+`hook/build.dart` stages the packaged native libraries for each supported
+OS/architecture. Flutter places Android hook outputs in the APK and iOS hook
+outputs in application frameworks.
 
 The runtime resolves `@Native` anchor symbols through Dart code assets and
 recovers the loaded module paths. It does not derive native-library locations

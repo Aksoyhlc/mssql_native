@@ -221,22 +221,35 @@ class MssqlRuntime {
       );
     }
 
-    // Desktop hooks own the default locations, including `dart run` where
+    // Build hooks own the default locations, including `dart run` where
     // resolvedExecutable is the Dart VM rather than the user's script.
     // Explicit paths retain the existing manual/native-build integration.
     ({String sybdb, String handlers})? assets;
     if (sybdbPath == null &&
         bridgePath == null &&
-        (Platform.isLinux || Platform.isWindows || Platform.isMacOS)) {
+        (Platform.isLinux ||
+            Platform.isWindows ||
+            Platform.isMacOS ||
+            Platform.isIOS)) {
       try {
-        assets = desktopCodeAssetPaths();
+        assets = bundledCodeAssetPaths();
       } catch (error) {
         throw MssqlException(
           type: MssqlErrorType.libraryLoad,
           message:
-              'Could not load the bundled desktop code assets: $error. '
+              'Could not load the bundled code assets: $error. '
               'Use Dart 3.10+ with dart run or dart build cli, or a compatible '
               'Flutter build, and distribute the entire application bundle.',
+        );
+      }
+    }
+    if (sybdbPath == null && bridgePath == null && Platform.isAndroid) {
+      try {
+        verifyAndroidCodeAssets();
+      } catch (error) {
+        throw MssqlException(
+          type: MssqlErrorType.libraryLoad,
+          message: 'Could not load the bundled Android code assets: $error.',
         );
       }
     }
