@@ -31,9 +31,9 @@ Future<bool> _stagePrebuiltMacOS(
   }
   for (var i = 0; i < sources.length; i++) {
     output.dependencies.add(files[i]);
-    final staged = await File.fromUri(files[i]).copy(
-      directory.resolve(sources[i].filename).toFilePath(),
-    );
+    final staged = await File.fromUri(
+      files[i],
+    ).copy(directory.resolve(sources[i].filename).toFilePath());
     output.assets.code.add(
       CodeAsset(
         package: input.packageName,

@@ -1,7 +1,6 @@
 import 'package:code_assets/code_assets.dart';
 import 'package:hooks/hooks.dart';
-
-import 'src/desktop.dart';
+import 'package:mssql_native/src/hook/desktop.dart';
 
 Future<void> main(List<String> args) async {
   await build(args, (input, output) async {
