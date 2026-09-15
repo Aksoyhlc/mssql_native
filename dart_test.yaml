@@ -1,0 +1,13 @@
+# VM only: this package is dart:ffi, so there is no web target to attempt.
+#
+# Concurrency is deliberately left at the default. The live tests are run one
+# file at a time by CI, because they share one SQL Server and a fixed schema and
+# would otherwise collide on the same tables — a data problem, not a driver one.
+#
+# Worth stating because the comparable package serialises its whole suite for a
+# different reason: its error handlers are Dart callbacks bound to a single
+# isolate, so a second connection on another isolate aborts the VM. This driver
+# keeps those two handlers in C so connections can run in parallel isolates.
+# See doc/ARCHITECTURE.md.
+platforms:
+  - vm

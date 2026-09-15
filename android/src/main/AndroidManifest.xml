@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- No permissions declared here. A driver that talks to a database needs
+         INTERNET, but that is the application's decision to make and declare,
+         not a library's to impose on every app that depends on it. -->
+</manifest>

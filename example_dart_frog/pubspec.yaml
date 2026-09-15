@@ -1,0 +1,11 @@
+name: mssql_native_dart_frog_example
+description: Dart Frog SQL Server endpoint used by the native-assets CI.
+publish_to: none
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+dependencies:
+  dart_frog: 1.2.6
+  mssql_native:
+    path: ../
+dev_dependencies:
+  dart_frog_cli: 1.2.14

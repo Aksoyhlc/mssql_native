@@ -1,0 +1,22 @@
+name: mssql_native_example
+publish_to: none
+version: 0.2.0
+
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mssql_native:
+    path: ../
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  integration_test:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

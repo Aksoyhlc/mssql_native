@@ -1,0 +1,8 @@
+name: mssql_native_cli_example
+description: Standalone Dart SQL Server client with automatic native packaging.
+publish_to: none
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+dependencies:
+  mssql_native:
+    path: ../

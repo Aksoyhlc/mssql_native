@@ -1,0 +1,12 @@
+.git
+**/.dart_tool
+**/build
+**/.build
+**/.native-build
+**/.swiftpm
+**/Pods
+**/.env
+**/.env.*
+native/vendor/openssl
+native/vendor/libressl
+native/vendor/libiconv

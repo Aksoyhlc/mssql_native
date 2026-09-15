@@ -1,0 +1,41 @@
+// The Android side of an FFI plugin: no Kotlin, no Java, no platform channel.
+//
+// Its entire job is to make Gradle put the prebuilt .so files from
+// src/main/jniLibs/<abi>/ into the APK, where Android's loader finds them by
+// bare name. The driver itself is Dart and reaches them through dart:ffi.
+group = 'com.aksoyhlc.mssql_native'
+version = '1.0'
+
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies { classpath 'com.android.tools.build:gradle:8.1.0' }
+}
+
+rootProject.allprojects {
+    repositories { google(); mavenCentral() }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace = 'com.aksoyhlc.mssql_native'
+    compileSdk = 34
+
+    defaultConfig {
+        // Flutter's own floor. This package adds none of its own: bundling
+        // libiconv is what keeps it here rather than at bionic's API 28, which
+        // is when iconv_open appeared - and bionic's iconv could not convert
+        // CP1254 anyway.
+        minSdk = 24
+
+        ndk {
+            // Matches what scripts/build_android.sh produces. Anything else in
+            // jniLibs would be packaged silently, so the ABIs are named.
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    sourceSets {
+        main.jniLibs.srcDirs = ['src/main/jniLibs']
+    }
+}
