@@ -1,5 +1,5 @@
 name: mssql_native
-description: A cross-platform SQL Server driver for Dart and Flutter with connection pooling for concurrent workloads, streaming queries, cancellation, and transactions.
+description: Native Microsoft SQL Server driver for Dart and Flutter, with connection pooling, streaming queries, cancellation, transactions, stored procedures and bulk copy.
 version: 0.0.2
 homepage: https://github.com/Aksoyhlc/mssql_native
 repository: https://github.com/Aksoyhlc/mssql_native

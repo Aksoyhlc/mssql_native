@@ -1,13 +1,13 @@
 # mssql_native
 
-Microsoft SQL Server client for Dart and Flutter.
+Native Microsoft SQL Server driver for Dart and Flutter.
 
 `mssql_native` is a complete database client: connections and pooling,
 transactions and savepoints, streaming results, cancellation, stored
 procedures, table-valued parameters and bulk copy. It talks to SQL Server
 directly, from a Flutter application, a Dart server or a command-line tool.
 
-The native SQL Server client libraries travel inside the package. Adding the
+FreeTDS-based native client libraries are bundled with the package. Adding the
 dependency is the whole installation — on your machine, on your build server
 and on the machine that eventually runs the application.
 
@@ -45,7 +45,6 @@ part of the SQL text.
 
 ## Contents
 
-- [Requirements](#requirements)
 - [Install](#install)
 - [Getting started](#getting-started)
 - [Queries and parameters](#queries-and-parameters)
@@ -58,23 +57,9 @@ part of the SQL text.
 - [Execution settings](#execution-settings)
 - [Error handling](#error-handling)
 - [Deployment](#deployment)
+- [Requirements](#requirements)
 - [Platform support](#platform-support)
 - [Documentation](#documentation)
-
-## Requirements
-
-- Dart 3.10 or later; Flutter 3.38 or later for Flutter applications
-- SQL Server 2008 or later, or Azure SQL
-- One of the supported targets listed under [Platform support](#platform-support)
-
-A server older than SQL Server 2016 that never received the TLS 1.2 update
-needs one extra line at startup; see
-[Old servers](#old-servers).
-
-The package uses a build hook to bundle its native libraries in Dart and
-Flutter applications. A standalone Dart SDK can resolve the package for a
-server or CLI; Flutter applications use the same Dart API and import path.
-The runtime does not import Flutter libraries.
 
 ## Install
 
@@ -693,6 +678,21 @@ Runnable examples in this repository:
 | [`example/`](example/) | Flutter application |
 | [`example_cli/`](example_cli/README.md) | Dart CLI, with Docker packaging |
 | [`example_dart_frog/`](example_dart_frog/README.md) | Dart Frog server |
+
+## Requirements
+
+- Dart 3.10 or later; Flutter 3.38 or later for Flutter applications
+- SQL Server 2008 or later, or Azure SQL
+- One of the supported targets listed under [Platform support](#platform-support)
+
+A server older than SQL Server 2016 that never received the TLS 1.2 update
+needs one extra line at startup; see
+[Old servers](#old-servers).
+
+The package uses a build hook to bundle its native libraries in Dart and
+Flutter applications. A standalone Dart SDK can resolve the package for a
+server or CLI; Flutter applications use the same Dart API and import path.
+The runtime does not import Flutter libraries.
 
 ## Platform support
 
