@@ -9,6 +9,7 @@ import 'models/bulk.dart';
 import 'models/config.dart';
 import 'models/result.dart';
 import 'models/types.dart';
+import 'observability.dart';
 import 'query_options.dart';
 import 'session.dart';
 import 'transaction.dart';
@@ -81,20 +82,43 @@ class _PooledSession with MssqlSession {
     int? maximumRows,
     int? maximumBytes,
     MssqlRetryPolicy? retry,
-  }) => _pool.withConnection(
-    cancellationToken: cancellationToken ?? options.cancellationToken,
-    (connection) => connection.query(
-      sql,
-      parameters: parameters,
-      options: options,
+  }) async {
+    final settings = options.merge(
       timeout: timeout,
       cancellationToken: cancellationToken,
       batchRows: batchRows,
       maximumRows: maximumRows,
       maximumBytes: maximumBytes,
       retry: retry,
-    ),
-  );
+    );
+    final observation = _pool._observationDispatcher.startQuery(
+      kind: MssqlQueryKind.query,
+      queryName: settings.queryName,
+      target: _pool._target,
+      inTransaction: false,
+      connectionId: null,
+      transactionId: null,
+    );
+    MssqlConnection? connection;
+    try {
+      connection = await _pool.acquire(
+        cancellationToken: settings.cancellationToken,
+      );
+      return await mssqlRunDelegatedQuery(
+        connection,
+        observation: observation,
+        sql: sql,
+        parameters: parameters,
+        options: settings,
+        allowTransaction: false,
+      );
+    } catch (error, stack) {
+      if (connection == null) observation?.fail(error, 0);
+      Error.throwWithStackTrace(error, stack);
+    } finally {
+      if (connection != null) await _pool.release(connection);
+    }
+  }
 
   @override
   Future<MssqlExecutionResult> callProcedure(
@@ -110,22 +134,47 @@ class _PooledSession with MssqlSession {
     MssqlProcedureMetadata? declared,
     MssqlMetadataDriftPolicy driftPolicy =
         MssqlMetadataDriftPolicy.preferDeclared,
-  }) => _pool.withConnection(
-    cancellationToken: cancellationToken ?? options.cancellationToken,
-    (connection) => connection.callProcedure(
-      procedure,
-      parameters: parameters,
-      outputParameters: outputParameters,
-      options: options,
-      timeout: timeout,
-      cancellationToken: cancellationToken,
-      batchRows: batchRows,
-      maximumRows: maximumRows,
-      maximumBytes: maximumBytes,
-      declared: declared,
-      driftPolicy: driftPolicy,
-    ),
-  );
+  }) async {
+    final settings = options
+        .merge(
+          timeout: timeout,
+          cancellationToken: cancellationToken,
+          batchRows: batchRows,
+          maximumRows: maximumRows,
+          maximumBytes: maximumBytes,
+        )
+        .withoutRetry;
+    final observation = _pool._observationDispatcher.startQuery(
+      kind: MssqlQueryKind.procedure,
+      queryName: settings.queryName,
+      target: _pool._target,
+      inTransaction: false,
+      connectionId: null,
+      transactionId: null,
+    );
+    MssqlConnection? connection;
+    try {
+      connection = await _pool.acquire(
+        cancellationToken: settings.cancellationToken,
+      );
+      return await mssqlRunDelegatedProcedure(
+        connection,
+        observation: observation,
+        procedure: procedure,
+        parameters: parameters,
+        outputParameters: outputParameters,
+        options: settings,
+        declared: declared,
+        driftPolicy: driftPolicy,
+        allowTransaction: false,
+      );
+    } catch (error, stack) {
+      if (connection == null) observation?.fail(error, 0);
+      Error.throwWithStackTrace(error, stack);
+    } finally {
+      if (connection != null) await _pool.release(connection);
+    }
+  }
 
   /// Holds the lease until the stream ends or the subscriber cancels.
   ///
@@ -142,22 +191,39 @@ class _PooledSession with MssqlSession {
     int? maximumRows,
     int? maximumBytes,
   }) async* {
-    final connection = await _pool.acquire(
-      cancellationToken: cancellationToken ?? options.cancellationToken,
+    final settings = options.merge(
+      timeout: timeout,
+      cancellationToken: cancellationToken,
+      batchRows: batchRows,
+      maximumRows: maximumRows,
+      maximumBytes: maximumBytes,
     );
+    final observation = _pool._observationDispatcher.startQuery(
+      kind: MssqlQueryKind.stream,
+      queryName: settings.queryName,
+      target: _pool._target,
+      inTransaction: false,
+      connectionId: null,
+      transactionId: null,
+    );
+    MssqlConnection? connection;
     try {
-      yield* connection.stream(
-        sql,
-        parameters: parameters,
-        options: options,
-        timeout: timeout,
-        cancellationToken: cancellationToken,
-        batchRows: batchRows,
-        maximumRows: maximumRows,
-        maximumBytes: maximumBytes,
+      connection = await _pool.acquire(
+        cancellationToken: settings.cancellationToken,
       );
+      yield* mssqlRunDelegatedStream(
+        connection,
+        observation: observation,
+        sql: sql,
+        parameters: parameters,
+        options: settings,
+        allowTransaction: false,
+      );
+    } catch (error, stack) {
+      if (connection == null) observation?.fail(error, 0);
+      Error.throwWithStackTrace(error, stack);
     } finally {
-      await _pool.release(connection);
+      if (connection != null) await _pool.release(connection);
     }
   }
 
@@ -169,17 +235,35 @@ class _PooledSession with MssqlSession {
     MssqlBulkOptions options = const MssqlBulkOptions(),
     MssqlCancellationToken? cancellationToken,
     void Function(int sentRows)? onProgress,
-  }) => _pool.withConnection(
-    cancellationToken: cancellationToken,
-    (connection) => connection.bulkInsert(
-      tableName: tableName,
-      rows: rows,
-      columns: columns,
-      options: options,
-      cancellationToken: cancellationToken,
-      onProgress: onProgress,
-    ),
-  );
+  }) async {
+    final observation = _pool._observationDispatcher.startBulk(
+      bulkName: options.bulkName,
+      target: _pool._target,
+      inTransaction: false,
+      connectionId: null,
+      transactionId: null,
+    );
+    MssqlConnection? connection;
+    try {
+      connection = await _pool.acquire(cancellationToken: cancellationToken);
+      return await mssqlRunDelegatedBulk(
+        connection,
+        observation: observation,
+        tableName: tableName,
+        rows: rows,
+        columns: columns,
+        options: options,
+        cancellationToken: cancellationToken,
+        onProgress: onProgress,
+        allowTransaction: false,
+      );
+    } catch (error, stack) {
+      if (connection == null) observation?.fail(error, 0);
+      Error.throwWithStackTrace(error, stack);
+    } finally {
+      if (connection != null) await _pool.release(connection);
+    }
+  }
 }
 
 /// A bounded pool of connections to one database.
@@ -193,22 +277,28 @@ class MssqlConnectionPool {
     this.connectionConfig, {
     this.poolConfig = const MssqlPoolConfig(),
     MssqlMetadataCache? metadataCache,
-  }) : metadataCache =
+    MssqlObserver? observer,
+  }) : _metadataCache =
            metadataCache ??
            MssqlMetadataCache(
              maxEntries: connectionConfig.metadataCacheSize,
              ttl: connectionConfig.metadataCacheTtl,
            ) {
+    poolId = MssqlObservationDispatcher.newPoolId();
+    _observationDispatcher = MssqlObservationDispatcher(
+      observer,
+      poolId: poolId,
+    );
     connectionConfig.validate();
     poolConfig.validate();
   }
 
   final MssqlConnectionConfig connectionConfig;
   final MssqlPoolConfig poolConfig;
+  late final int poolId;
+  late final MssqlObservationDispatcher _observationDispatcher;
 
-  /// Procedure and bulk-table describes shared by every lease, so two
-  /// statements on different leases do not describe the same procedure twice.
-  final MssqlMetadataCache metadataCache;
+  final MssqlMetadataCache _metadataCache;
   final Queue<_IdleConnection> _idle = Queue<_IdleConnection>();
   final Queue<_PoolWaiter> _waiters = Queue<_PoolWaiter>();
   final Set<MssqlConnection> _owned = HashSet<MssqlConnection>.identity();
@@ -223,13 +313,28 @@ class MssqlConnectionPool {
   int get createdCount => _created;
   int get idleCount => _idle.length;
   int get waitingCount => _waiters.length;
+  int get borrowedCount => _borrowed.length;
+  int get openingCount => _opening;
+  MssqlPoolMetricsSnapshot get metrics => MssqlPoolMetricsSnapshot(
+    created: _created,
+    idle: _idle.length,
+    borrowed: _borrowed.length,
+    opening: _opening,
+    waiting: _waiters.length,
+    maximumSize: poolConfig.maximumSize,
+  );
+  MssqlObservationTarget get _target => MssqlObservationTarget(
+    host: connectionConfig.host,
+    port: connectionConfig.port,
+    database: connectionConfig.database,
+  );
 
   /// Drops cached procedure and bulk-table metadata for every lease.
   void invalidateMetadata({String? object}) {
     if (object == null) {
-      metadataCache.clear();
+      _metadataCache.clear();
     } else {
-      metadataCache.invalidate(key: object);
+      _metadataCache.invalidate(key: object);
     }
     for (final connection in _owned) {
       connection.invalidateMetadata(object: object);
@@ -303,14 +408,42 @@ class MssqlConnectionPool {
     Future<T> Function(MssqlTransaction transaction) callback, {
     MssqlIsolationLevel isolationLevel = MssqlIsolationLevel.baseline,
     MssqlCancellationToken? cancellationToken,
-  }) => withConnection(
-    cancellationToken: cancellationToken,
-    (connection) => connection.transaction(
-      callback,
-      isolationLevel: isolationLevel,
-      cancellationToken: cancellationToken,
-    ),
-  );
+    String? transactionName,
+  }) async {
+    final observation = _observationDispatcher.startTransaction(
+      transactionName: transactionName,
+      target: _target,
+      connectionId: null,
+    );
+    MssqlConnection? connection;
+    MssqlTransaction? transaction;
+    try {
+      connection = await acquire(cancellationToken: cancellationToken);
+      observation?.connectionId = connection.connectionId;
+      transaction = await mssqlBeginDelegatedTransaction(
+        connection,
+        isolationLevel: isolationLevel,
+        cancellationToken: cancellationToken,
+        observation: observation,
+      );
+      final value = await callback(transaction);
+      await transaction.commit();
+      await transaction.close();
+      return value;
+    } catch (error, stack) {
+      if (connection == null) {
+        observation?.fail(error, MssqlTransactionSettlement.unknown);
+      } else if (transaction != null) {
+        await mssqlRollbackAfterCallbackError(transaction, error);
+        try {
+          await transaction.close();
+        } catch (_) {}
+      }
+      Error.throwWithStackTrace(error, stack);
+    } finally {
+      if (connection != null) await release(connection);
+    }
+  }
 
   /// Borrows a connection.
   ///
@@ -321,7 +454,7 @@ class MssqlConnectionPool {
     MssqlCancellationToken? cancellationToken,
   }) async {
     if (_closed) throw StateError('The pool is closed.');
-    cancellationToken?.throwIfCancelled();
+    mssqlThrowIfCancelled(cancellationToken);
     final deadline = DateTime.now().add(poolConfig.acquireTimeout);
     while (_idle.isNotEmpty) {
       final entry = _idle.removeFirst();
@@ -369,7 +502,7 @@ class MssqlConnectionPool {
     DateTime deadline,
     MssqlCancellationToken? cancellationToken,
   ) {
-    cancellationToken?.throwIfCancelled();
+    mssqlThrowIfCancelled(cancellationToken);
     if (!DateTime.now().isAfter(deadline)) return;
     throw MssqlPoolTimeoutException(
       message:
@@ -415,6 +548,12 @@ class MssqlConnectionPool {
     DateTime deadline,
     MssqlCancellationToken? cancellationToken,
   ) {
+    final waitWatch = _observationDispatcher.enabled
+        ? (Stopwatch()..start())
+        : null;
+    final waitOperationId = _observationDispatcher.enabled
+        ? _observationDispatcher.newOperationId()
+        : null;
     final waiter = _PoolWaiter(deadline, cancellationToken);
     _waiters.addLast(waiter);
     void fail(MssqlException error) {
@@ -441,14 +580,54 @@ class MssqlConnectionPool {
     );
     // A cancelled caller stops queueing immediately rather than holding its
     // place until the timeout.
-    waiter.unregisterCancellation = cancellationToken?.register(
+    waiter.unregisterCancellation = mssqlRegisterCancellation(
+      cancellationToken,
       () => fail(
         const MssqlCancelledException(
           message: 'The SQL connection acquire was cancelled.',
         ),
       ),
     );
-    return waiter.completer.future.whenComplete(waiter.dispose);
+    return waiter.completer.future
+        .then(
+          (connection) {
+            _emitPoolWait(
+              waitOperationId,
+              waitWatch,
+              MssqlPoolWaitOutcome.acquired,
+            );
+            return connection;
+          },
+          onError: (Object error, StackTrace stack) {
+            final outcome = switch (error) {
+              MssqlPoolTimeoutException _ => MssqlPoolWaitOutcome.timedOut,
+              MssqlCancelledException _ => MssqlPoolWaitOutcome.cancelled,
+              StateError _ => MssqlPoolWaitOutcome.poolClosed,
+              _ => MssqlPoolWaitOutcome.failed,
+            };
+            _emitPoolWait(waitOperationId, waitWatch, outcome);
+            Error.throwWithStackTrace(error, stack);
+          },
+        )
+        .whenComplete(waiter.dispose);
+  }
+
+  void _emitPoolWait(
+    int? operationId,
+    Stopwatch? watch,
+    MssqlPoolWaitOutcome outcome,
+  ) {
+    if (operationId == null || watch == null) return;
+    _observationDispatcher.poolWait(
+      MssqlPoolWaitEvent(
+        operationId: operationId,
+        poolId: poolId,
+        target: _target,
+        elapsed: watch.elapsed,
+        outcome: outcome,
+        metrics: metrics,
+      ),
+    );
   }
 
   Future<MssqlConnection> _openWithRetry({
@@ -465,11 +644,12 @@ class MssqlConnectionPool {
     for (var attempt = 0; attempt < delays.length; attempt++) {
       if (attempt > 0) await Future<void>.delayed(delays[attempt]);
       if (deadline != null) _checkAcquireBudget(deadline, cancellationToken);
-      cancellationToken?.throwIfCancelled();
+      mssqlThrowIfCancelled(cancellationToken);
       try {
-        return await MssqlConnection.open(
+        return await mssqlOpenPooledConnection(
           connectionConfig,
-          metadataCache: metadataCache,
+          metadataCache: _metadataCache,
+          dispatcher: _observationDispatcher,
         );
       } catch (error, stack) {
         lastError = error;
@@ -516,7 +696,7 @@ class MssqlConnectionPool {
       if (!_closed) _serviceWaiters();
       return;
     }
-    await connection.restoreSessionBaseline();
+    await mssqlRestoreSessionBaseline(connection);
     if (connection.isSessionDirty) {
       _discard(connection);
       await connection.close();

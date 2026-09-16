@@ -392,6 +392,43 @@ Each carries SQL Server's message number as `code`, its error state as
 had one. `type` remains for a switch, and is what crosses from the worker
 isolate.
 
+## Observability
+
+`MssqlConnection.connect`, `connectIntegrated`, `connectString`, `open` and
+`MssqlConnectionPool` accept an optional `MssqlObserver`. One observer can
+translate typed events into OpenTelemetry spans, logs or application metrics
+without adding a telemetry dependency to the driver.
+
+Query events cover `query`, its convenience terminals, procedures and streams.
+Bulk and transaction operations have separate start/complete/error hooks.
+Connections report logical open/close events, while successful internal
+repairs increment `MssqlConnection.repairCount` and appear on query terminal
+events. A retry is one logical event with `attemptCount == 2`.
+
+`MssqlConnectionPool.metrics` returns an immutable snapshot of created, idle,
+borrowed, opening and waiting connections plus the configured maximum. An
+`onPoolWait` event is emitted only for a real wait caused by a full pool; its
+outcome distinguishes acquire, timeout, cancellation and pool shutdown.
+An opening failure after the wait is reported as `failed`.
+
+Start callbacks may return any adapter-owned state, such as a span. A terminal
+callback receives that exact state, including `null`. If a start callback
+throws, the driver reports it through `onObserverError`, skips the matching
+terminal callback, and continues the database operation. Errors from every
+other observer callback are isolated the same way.
+
+Events never contain SQL/procedure text, parameter names or values,
+credentials, connection strings, bulk identifiers, row values, raw exceptions,
+stack traces or server diagnostics. `MssqlObservedError` contains only a safe
+type name, driver classification, numeric code/state and retry/outcome flags.
+
+For OpenTelemetry database spans use `db.system.name =
+microsoft.sql_server`. The application label is exposed as `queryName`,
+`bulkName` or `transactionName`; use it as a span name and a custom
+`mssql_native.*_name` attribute. The driver does not assert that an arbitrary
+application label satisfies the semantic requirements of `db.query.summary`
+or `db.operation.name`.
+
 ## Pool sizing
 
 Defaults are min 0, max 2, a 15-second budget for a whole `acquire`, a

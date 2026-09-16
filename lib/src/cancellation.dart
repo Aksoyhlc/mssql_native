@@ -1,7 +1,5 @@
 import 'dart:async';
 
-import 'package:meta/meta.dart';
-
 import 'exception.dart';
 
 /// A cancellation signal shared by one or more operations.
@@ -41,8 +39,7 @@ class MssqlCancellationToken {
     }
   }
 
-  @internal
-  void Function() register(void Function() listener) {
+  void Function() _register(void Function() listener) {
     if (_cancelled) {
       listener();
       return () {};
@@ -56,8 +53,7 @@ class MssqlCancellationToken {
   /// The subclass, not the base type: `on MssqlCancelledException` is what the
   /// documentation tells a caller to write, and a base `MssqlException` here
   /// would slip past it and land in whichever broader handler came next.
-  @internal
-  void throwIfCancelled() {
+  void _throwIfCancelled() {
     if (!_cancelled) return;
     throw MssqlCancelledException(
       message: _reason == null || _reason!.isEmpty
@@ -66,3 +62,11 @@ class MssqlCancellationToken {
     );
   }
 }
+
+void mssqlThrowIfCancelled(MssqlCancellationToken? token) =>
+    token?._throwIfCancelled();
+
+void Function()? mssqlRegisterCancellation(
+  MssqlCancellationToken? token,
+  void Function() listener,
+) => token?._register(listener);

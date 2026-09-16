@@ -15,7 +15,7 @@ import 'native/library_paths.dart';
 
 @immutable
 class MssqlRuntimeDiagnostics {
-  const MssqlRuntimeDiagnostics({
+  const MssqlRuntimeDiagnostics._({
     required this.freeTdsVersion,
     required this.handlersAbiVersion,
     required this.tlsAvailable,
@@ -39,6 +39,26 @@ class MssqlRuntimeDiagnostics {
   final String handlersPath;
   final String platform;
 }
+
+void mssqlEnsureCanOpenConnection(MssqlRuntime runtime) =>
+    runtime._ensureCanOpenConnection();
+
+void mssqlBeginConnectionOpen(MssqlRuntime runtime) =>
+    runtime._beginConnectionOpen();
+
+void mssqlEndConnectionOpen(MssqlRuntime runtime) =>
+    runtime._endConnectionOpen();
+
+void mssqlRegisterConnection(
+  MssqlRuntime runtime,
+  Object connection,
+  Future<void> Function() closeForShutdown,
+) => runtime._registerConnection(connection, closeForShutdown);
+
+void mssqlUnregisterConnection(MssqlRuntime runtime, Object connection) =>
+    runtime._unregisterConnection(connection);
+
+String mssqlRuntimeHandlersPath(MssqlRuntime runtime) => runtime._handlersPath;
 
 /// Locates FreeTDS and the handler library, and makes both loadable.
 ///
@@ -90,7 +110,7 @@ class MssqlRuntime {
 
   /// The handler library — `mssql_native.dll`, `libmssql_native.so`,
   /// `MssqlNativeBridge.framework`.
-  String get handlersPath =>
+  String get _handlersPath =>
       _handlersLocator ?? (throw StateError('MssqlRuntime is not initialized'));
 
   /// Resolves and preloads FreeTDS and the handler library.
@@ -352,7 +372,7 @@ class MssqlRuntime {
     _handlersLocator = handlers;
     _handlers = library;
     final dbLibrary = DbLib(DynamicLibrary.open(resolved));
-    _diagnostics = MssqlRuntimeDiagnostics(
+    _diagnostics = MssqlRuntimeDiagnostics._(
       freeTdsVersion: dbLibrary.dbversion().toDartString(),
       handlersAbiVersion: library.abi(),
       tlsAvailable: _hasTls,
@@ -364,7 +384,7 @@ class MssqlRuntime {
     _initialized = true;
   }
 
-  void ensureCanOpenConnection() {
+  void _ensureCanOpenConnection() {
     if (!_initialized || _shuttingDown) {
       throw StateError(
         _shuttingDown
@@ -374,14 +394,12 @@ class MssqlRuntime {
     }
   }
 
-  @internal
-  void beginConnectionOpen() {
-    ensureCanOpenConnection();
+  void _beginConnectionOpen() {
+    _ensureCanOpenConnection();
     _opensInProgress++;
   }
 
-  @internal
-  void endConnectionOpen() {
+  void _endConnectionOpen() {
     if (_opensInProgress > 0) _opensInProgress--;
     if (_opensInProgress == 0) {
       _opensDrained?.complete();
@@ -389,16 +407,14 @@ class MssqlRuntime {
     }
   }
 
-  @internal
-  void registerConnection(
+  void _registerConnection(
     Object connection,
     Future<void> Function() closeForShutdown,
   ) {
     _connections[connection] = closeForShutdown;
   }
 
-  @internal
-  void unregisterConnection(Object connection) {
+  void _unregisterConnection(Object connection) {
     _connections.remove(connection);
   }
 

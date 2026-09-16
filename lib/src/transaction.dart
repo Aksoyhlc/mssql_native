@@ -7,6 +7,7 @@ import 'models/config.dart';
 import 'models/result.dart';
 import 'models/types.dart';
 import 'native/worker.dart';
+import 'observability.dart';
 import 'query_options.dart';
 import 'session.dart';
 
@@ -16,10 +17,15 @@ import 'session.dart';
 /// a session runs unchanged inside a transaction. Nothing here is ever retried:
 /// reconnecting would abandon the transaction.
 class MssqlTransaction with MssqlSession {
-  MssqlTransaction.internal(this.connection, this._worker);
+  MssqlTransaction._(
+    this.connection,
+    this._worker, {
+    required MssqlTransactionObservation? observation,
+  }) : _observation = observation;
 
   final MssqlConnection connection;
   final ConnectionWorker _worker;
+  final MssqlTransactionObservation? _observation;
   bool _completed = false;
   bool _closed = false;
   bool _doomed = false;
@@ -43,6 +49,7 @@ class MssqlTransaction with MssqlSession {
   /// `ROLLBACK TO SAVEPOINT` does, and a later statement would only hide the
   /// first error.
   bool get isDoomed => _doomed;
+  int? get transactionId => _observation?.transactionId;
 
   @override
   Future<void> ping({MssqlCancellationToken? cancellationToken}) {
@@ -66,17 +73,30 @@ class MssqlTransaction with MssqlSession {
     MssqlRetryPolicy? retry,
   }) {
     _ensureActive();
-    return connection.executeWithinTransaction(
-      sql,
+    final settings = options
+        .merge(
+          timeout: timeout,
+          cancellationToken: cancellationToken,
+          batchRows: batchRows,
+          maximumRows: maximumRows,
+          maximumBytes: maximumBytes,
+          retry: retry,
+        )
+        .withoutRetry;
+    final observation = mssqlStartConnectionQueryObservation(
+      connection,
+      kind: MssqlQueryKind.query,
+      queryName: settings.queryName,
+      inTransaction: true,
+      transactionId: transactionId,
+    );
+    return mssqlRunDelegatedQuery(
+      connection,
+      observation: observation,
+      sql: sql,
       parameters: parameters,
-      options: options.merge(
-        timeout: timeout,
-        cancellationToken: cancellationToken,
-        batchRows: batchRows,
-        maximumRows: maximumRows,
-        maximumBytes: maximumBytes,
-        retry: retry,
-      ),
+      options: settings,
+      allowTransaction: true,
     );
   }
 
@@ -96,16 +116,29 @@ class MssqlTransaction with MssqlSession {
         MssqlMetadataDriftPolicy.preferDeclared,
   }) {
     _ensureActive();
-    return connection.callProcedure(
-      procedure,
+    final settings = options
+        .merge(
+          timeout: timeout,
+          cancellationToken: cancellationToken,
+          batchRows: batchRows,
+          maximumRows: maximumRows,
+          maximumBytes: maximumBytes,
+        )
+        .withoutRetry;
+    final observation = mssqlStartConnectionQueryObservation(
+      connection,
+      kind: MssqlQueryKind.procedure,
+      queryName: settings.queryName,
+      inTransaction: true,
+      transactionId: transactionId,
+    );
+    return mssqlRunDelegatedProcedure(
+      connection,
+      observation: observation,
+      procedure: procedure,
       parameters: parameters,
       outputParameters: outputParameters,
-      options: options,
-      timeout: timeout,
-      cancellationToken: cancellationToken,
-      batchRows: batchRows,
-      maximumRows: maximumRows,
-      maximumBytes: maximumBytes,
+      options: settings,
       declared: declared,
       driftPolicy: driftPolicy,
       allowTransaction: true,
@@ -122,17 +155,28 @@ class MssqlTransaction with MssqlSession {
     int? batchRows,
     int? maximumRows,
     int? maximumBytes,
-  }) {
+  }) async* {
     _ensureActive();
-    return connection.stream(
-      sql,
-      parameters: parameters,
-      options: options,
+    final settings = options.merge(
       timeout: timeout,
       cancellationToken: cancellationToken,
       batchRows: batchRows,
       maximumRows: maximumRows,
       maximumBytes: maximumBytes,
+    );
+    final observation = mssqlStartConnectionQueryObservation(
+      connection,
+      kind: MssqlQueryKind.stream,
+      queryName: settings.queryName,
+      inTransaction: true,
+      transactionId: transactionId,
+    );
+    yield* mssqlRunDelegatedStream(
+      connection,
+      observation: observation,
+      sql: sql,
+      parameters: parameters,
+      options: settings,
       allowTransaction: true,
     );
   }
@@ -147,7 +191,15 @@ class MssqlTransaction with MssqlSession {
     void Function(int sentRows)? onProgress,
   }) {
     _ensureActive();
-    return connection.bulkInsert(
+    final observation = mssqlStartConnectionBulkObservation(
+      connection,
+      bulkName: options.bulkName,
+      inTransaction: true,
+      transactionId: transactionId,
+    );
+    return mssqlRunDelegatedBulk(
+      connection,
+      observation: observation,
       tableName: tableName,
       rows: rows,
       columns: columns,
@@ -172,12 +224,16 @@ class MssqlTransaction with MssqlSession {
   Future<T> savepoint<T>(Future<T> Function() callback) async {
     _ensureActive();
     final name = 'mssql_native_sp_${++_savepoints}';
-    await connection.executeWithinTransaction('SAVE TRANSACTION [$name];');
+    await mssqlExecuteWithinTransaction(
+      connection,
+      'SAVE TRANSACTION [$name];',
+    );
     try {
       return await callback();
     } catch (error, stack) {
       try {
-        await connection.executeWithinTransaction(
+        await mssqlExecuteWithinTransaction(
+          connection,
           'ROLLBACK TRANSACTION [$name];',
         );
       } catch (_) {
@@ -193,7 +249,8 @@ class MssqlTransaction with MssqlSession {
   Future<void> commit() async {
     _ensureActive();
     try {
-      await connection.runTransactionNative(
+      await mssqlRunTransactionNative(
+        connection,
         () => _worker.runSql(
           'COMMIT TRANSACTION;',
           connection.config.defaultQueryTimeout,
@@ -207,35 +264,42 @@ class MssqlTransaction with MssqlSession {
       _closed = true;
       if (error.type == MssqlErrorType.connection ||
           error.type == MssqlErrorType.connectionLost) {
-        await connection.discardAfterTransactionFailure();
-        throw MssqlUnknownCommitOutcomeException(error.message);
+        await mssqlDiscardAfterTransactionFailure(connection);
+        final unknown = MssqlUnknownCommitOutcomeException(error.message);
+        _observation?.fail(unknown, MssqlTransactionSettlement.unknown);
+        throw unknown;
       }
       // Any other failed COMMIT must still release the connection. A failed
       // commit leaves the same ambiguity as a failed rollback, so
       // `settleAfterFailedRollback` reads `@@TRANCOUNT` and releases the lease
       // only when the session proves it holds no transaction.
-      await connection.settleAfterFailedRollback();
+      await mssqlSettleAfterFailedRollback(connection);
+      _observation?.fail(error, MssqlTransactionSettlement.unknown);
       rethrow;
     }
     _completed = true;
+    _observation?.complete(MssqlTransactionOutcome.committed);
   }
 
   Future<void> rollback() async {
     if (_closed || _completed) return;
     try {
       await _rollbackNative();
-    } catch (_) {
+    } catch (error) {
       // The server never confirmed the rollback. The connection survives only
       // if it can prove it has no transaction left open.
       _completed = true;
       _closed = true;
-      await connection.settleAfterFailedRollback();
+      await mssqlSettleAfterFailedRollback(connection);
+      _observation?.fail(error, MssqlTransactionSettlement.unknown);
       rethrow;
     }
     _completed = true;
+    _observation?.complete(MssqlTransactionOutcome.rolledBack);
   }
 
-  Future<void> _rollbackNative() => connection.runTransactionNative(
+  Future<void> _rollbackNative() => mssqlRunTransactionNative(
+    connection,
     () => _worker.runSql(
       'ROLLBACK TRANSACTION;',
       connection.config.defaultQueryTimeout,
@@ -246,19 +310,38 @@ class MssqlTransaction with MssqlSession {
     if (_closed) return;
     _closed = true;
     if (_completed) {
-      await connection.releaseAfterTransaction();
+      await mssqlReleaseAfterTransaction(connection);
       return;
     }
     _completed = true;
     try {
       await _rollbackNative();
-    } catch (_) {
+    } catch (error) {
       // close() never throws, so the session is inspected instead: it is
       // released if it is provably clean and discarded otherwise.
-      await connection.settleAfterFailedRollback();
+      await mssqlSettleAfterFailedRollback(connection);
+      _observation?.fail(error, MssqlTransactionSettlement.unknown);
       return;
     }
-    await connection.releaseAfterTransaction();
+    _observation?.complete(MssqlTransactionOutcome.rolledBack);
+    await mssqlReleaseAfterTransaction(connection);
+  }
+
+  Future<void> _rollbackAfterCallbackError(Object callbackError) async {
+    if (_closed || _completed) {
+      _observation?.fail(callbackError, MssqlTransactionSettlement.unknown);
+      return;
+    }
+    try {
+      await _rollbackNative();
+      _completed = true;
+      _observation?.fail(callbackError, MssqlTransactionSettlement.rolledBack);
+    } catch (_) {
+      _completed = true;
+      _closed = true;
+      await mssqlSettleAfterFailedRollback(connection);
+      _observation?.fail(callbackError, MssqlTransactionSettlement.unknown);
+    }
   }
 
   void _ensureActive() {
@@ -273,3 +356,14 @@ class MssqlTransaction with MssqlSession {
     }
   }
 }
+
+MssqlTransaction mssqlCreateTransaction(
+  MssqlConnection connection,
+  ConnectionWorker worker, {
+  required MssqlTransactionObservation? observation,
+}) => MssqlTransaction._(connection, worker, observation: observation);
+
+Future<void> mssqlRollbackAfterCallbackError(
+  MssqlTransaction transaction,
+  Object callbackError,
+) => transaction._rollbackAfterCallbackError(callbackError);

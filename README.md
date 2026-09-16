@@ -56,6 +56,7 @@ part of the SQL text.
 - [Encryption and certificate trust](#encryption-and-certificate-trust)
 - [Execution settings](#execution-settings)
 - [Error handling](#error-handling)
+- [Observability](#observability)
 - [Deployment](#deployment)
 - [Requirements](#requirements)
 - [Platform support](#platform-support)
@@ -640,6 +641,68 @@ Future<Response> createCustomer(Request request) async {
   }
 }
 ```
+
+## Observability
+
+Pass an `MssqlObserver` to a connection or pool for synchronous, typed query,
+stream, bulk, transaction, connection and real pool-wait events. The driver has
+no OpenTelemetry dependency; an observer is the adapter boundary.
+
+```dart
+final pool = MssqlConnectionPool(config, observer: AppDatabaseObserver());
+
+final class AppDatabaseObserver extends MssqlObserver {
+  @override
+  Object? onQueryStart(MssqlQueryStartEvent event) {
+    return tracer.startSpan(
+      event.queryName ?? 'mssql.query',
+      attributes: {
+        'db.system.name': 'microsoft.sql_server',
+        'db.namespace': event.target.database,
+        'server.address': event.target.host,
+        'server.port': event.target.port,
+        if (event.queryName != null)
+          'mssql_native.query_name': event.queryName!,
+      },
+    );
+  }
+
+  @override
+  void onQueryComplete(MssqlQueryCompleteEvent event, Object? state) {
+    final span = state as AppSpan?;
+    span
+      ?..setAttribute('mssql_native.attempt_count', event.attemptCount)
+      ..setAttribute('mssql_native.rows_affected', event.affectedRows)
+      ..end();
+  }
+}
+```
+
+Callbacks must stay lightweight; hand export work to the telemetry SDK's batch
+processor. Callback failures never replace a database result. If a start hook
+throws, `onObserverError` is called and that operation receives no terminal
+hook. A successful start that returns `null` still receives its terminal hook
+with `null` state.
+
+Only safe metadata reaches events: labels, endpoint host/port/database,
+durations, counts and classified error fields. SQL and procedure text,
+parameter names or values, credentials, bulk table/column names, row values,
+raw exceptions and server diagnostics are never exposed. `queryName`,
+`MssqlBulkOptions.bulkName` and `transactionName` should be stable,
+low-cardinality application labels.
+
+A retry remains one logical query event and reports `attemptCount: 2`.
+`connectionRepaired` and `connectionRepairCount` distinguish reconnects from an
+ordinary slow query. Pool wait events are emitted only when the bounded pool is
+full and the caller enters its waiter queue. Internal session setup, metadata
+lookups, validation pings and transaction-control SQL do not create query
+events.
+
+For OpenTelemetry, use `db.system.name = microsoft.sql_server`, CLIENT spans,
+`db.namespace`, `server.address` and `server.port`. The safe label belongs in
+the span name and `mssql_native.query_name`; it is not automatically mapped to
+`db.operation.name` or `db.query.summary`. Span duration is the time between
+the start and terminal callbacks, not a `db.duration` attribute.
 
 ## Deployment
 

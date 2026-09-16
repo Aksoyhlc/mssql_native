@@ -55,6 +55,7 @@ class MssqlBulkOptions {
     this.mode = MssqlBulkMode.atomic,
     this.batchSize = 1000,
     this.timeout = const Duration(minutes: 2),
+    this.bulkName,
     this.keepNulls = false,
     this.checkConstraints = false,
     this.fireTriggers = false,
@@ -67,6 +68,11 @@ class MssqlBulkOptions {
   final MssqlBulkMode mode;
   final int batchSize;
   final Duration timeout;
+
+  /// A safe, low-cardinality label for observability.
+  ///
+  /// The destination table and row values are never exposed to observers.
+  final String? bulkName;
 
   /// When true, an omitted or null field stores NULL rather than the column
   /// default. BCP's default is the opposite: KEEP_NULLS off.

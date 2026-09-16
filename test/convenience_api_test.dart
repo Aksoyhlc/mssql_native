@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:mssql_native/mssql_native.dart';
+import 'package:mssql_native/src/cancellation.dart';
 import 'package:mssql_native/src/models/parameter.dart';
 import 'package:test/test.dart';
 
@@ -303,7 +304,7 @@ void main() {
     test('cancellation is single-use and reports the first reason', () {
       final token = MssqlCancellationToken();
       var calls = 0;
-      token.register(() => calls++);
+      mssqlRegisterCancellation(token, () => calls++);
 
       token.cancel('HTTP request ended');
       token.cancel('later reason');
@@ -312,7 +313,7 @@ void main() {
       expect(token.reason, 'HTTP request ended');
       expect(calls, 1);
       expect(
-        token.throwIfCancelled,
+        () => mssqlThrowIfCancelled(token),
         throwsA(
           isA<MssqlException>()
               .having((error) => error.type, 'type', MssqlErrorType.cancelled)
@@ -328,13 +329,13 @@ void main() {
     test('unregistered and late listeners behave deterministically', () {
       final token = MssqlCancellationToken();
       var removedCalls = 0;
-      final unregister = token.register(() => removedCalls++);
-      unregister();
+      final unregister = mssqlRegisterCancellation(token, () => removedCalls++);
+      unregister!();
       token.cancel();
       expect(removedCalls, 0);
 
       var lateCalls = 0;
-      token.register(() => lateCalls++);
+      mssqlRegisterCancellation(token, () => lateCalls++);
       expect(lateCalls, 1);
     });
 
@@ -350,4 +351,3 @@ void main() {
     );
   });
 }
-

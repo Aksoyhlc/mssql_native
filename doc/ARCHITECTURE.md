@@ -38,7 +38,8 @@ serves Flutter and plain Dart.
 Native calls block, and one native connection cannot safely serve concurrent
 commands. Each `MssqlConnection` therefore owns a worker isolate and a single
 native connection for its lifetime. The operation gate in
-`lib/src/connection.dart` queues commands before they reach that worker.
+`lib/src/connection/operation_gate.dart` queues commands before they reach that
+worker.
 
 Consequences:
 
@@ -119,13 +120,35 @@ That repair is separate from retry. Arbitrary SQL is not repeated. An explicit
 `MssqlRetryPolicy.idempotentRead` allows one reconnect-and-repeat only outside
 transactions and only when the caller has declared the statement safe.
 
+## Observability
+
+`lib/src/observability.dart` defines the public, dependency-free event contract
+and the internal dispatcher that isolates callback failures. Public connection,
+pool and transaction entry points create one explicit observation handle and
+pass it to delegated connection core functions. No Zone or other ambient state
+is used, so stream subscription and wrapper behaviour remain visible in the
+call graph.
+
+Pool session operations start before acquire and delegate through unobserved
+connection cores. Transaction operations attach their transaction id in the
+same way. Internal setup, metadata, validation and transaction-control commands
+bypass the public observation boundary. Retry stays below that boundary, so a
+reconnect-and-repeat remains one logical event while attempt and repair counters
+retain the recovery signal.
+
 ## Authoritative code map
 
 | Concern | Source |
 |---|---|
 | Public exports | `lib/mssql_native.dart` |
+| Observability contract and dispatch | `lib/src/observability.dart` |
 | Session contract | `lib/src/session.dart` |
-| Connection lifecycle and gate | `lib/src/connection.dart` |
+| Connection lifecycle | `lib/src/connection.dart` |
+| Operation gate | `lib/src/connection/operation_gate.dart` |
+| Catalog metadata decoding | `lib/src/connection/metadata_decoder.dart` |
+| Procedure parameter binding | `lib/src/connection/procedure_binder.dart` |
+| Bulk value binding | `lib/src/connection/bulk_binder.dart` |
+| Login and TLS guards | `lib/src/connection/login_guard.dart` |
 | Pool leasing | `lib/src/connection_pool.dart` |
 | Transactions and savepoints | `lib/src/transaction.dart` |
 | Runtime and TLS setup | `lib/src/runtime.dart`, `lib/src/models/config.dart` |

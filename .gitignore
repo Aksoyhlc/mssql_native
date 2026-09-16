@@ -1,6 +1,7 @@
 .dart_tool/
 .packages
 .pub/
+/pubspec.lock
 build/
 .build/
 .swiftpm/

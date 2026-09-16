@@ -1,8 +1,12 @@
 import 'dart:async';
-import 'dart:collection';
-import 'dart:typed_data';
 
 import 'cancellation.dart';
+import 'connection/bulk_binder.dart';
+import 'connection/login_guard.dart';
+import 'connection/metadata_decoder.dart';
+import 'connection/operation_gate.dart';
+import 'connection/procedure_binder.dart';
+import 'connection/row_budget.dart';
 import 'exception.dart';
 import 'metadata_cache.dart';
 import 'models/bulk.dart';
@@ -11,191 +15,13 @@ import 'models/parameter.dart';
 import 'models/result.dart';
 import 'models/types.dart';
 import 'native/worker.dart';
+import 'observability.dart';
 import 'query_options.dart';
 import 'runtime.dart';
 import 'session.dart';
 import 'session_state.dart';
 import 'sql.dart';
 import 'transaction.dart';
-
-class _OperationWaiter {
-  _OperationWaiter(this.started);
-
-  final Stopwatch started;
-  final Completer<void> ready = Completer<void>();
-  void Function()? unregisterCancellation;
-}
-
-class _OperationLease {
-  _OperationLease(this.queueWait, this._release);
-
-  final Duration queueWait;
-  final void Function() _release;
-  bool _released = false;
-
-  void release() {
-    if (_released) return;
-    _released = true;
-    _release();
-  }
-}
-
-class _OperationGate {
-  final Queue<_OperationWaiter> _waiters = Queue<_OperationWaiter>();
-  bool _locked = false;
-
-  Future<_OperationLease> acquire(MssqlCancellationToken? token) async {
-    token?.throwIfCancelled();
-    final started = Stopwatch()..start();
-    if (!_locked) {
-      _locked = true;
-      return _OperationLease(started.elapsed, _release);
-    }
-
-    final waiter = _OperationWaiter(started);
-    _waiters.addLast(waiter);
-    if (token != null) {
-      waiter.unregisterCancellation = token.register(() {
-        if (!_waiters.remove(waiter) || waiter.ready.isCompleted) return;
-        try {
-          token.throwIfCancelled();
-        } catch (error, stack) {
-          waiter.ready.completeError(error, stack);
-        }
-      });
-    }
-    try {
-      await waiter.ready.future;
-      try {
-        token?.throwIfCancelled();
-      } catch (_) {
-        // The waiter already owns the gate once [ready] completes. If the
-        // token is cancelled between that completion and this continuation,
-        // hand the gate to the next waiter instead of leaking the lock.
-        _release();
-        rethrow;
-      }
-      return _OperationLease(started.elapsed, _release);
-    } catch (_) {
-      waiter.unregisterCancellation?.call();
-      rethrow;
-    }
-  }
-
-  void _release() {
-    while (_waiters.isNotEmpty) {
-      final next = _waiters.removeFirst();
-      next.unregisterCancellation?.call();
-      if (next.ready.isCompleted) continue;
-      next.ready.complete();
-      return;
-    }
-    _locked = false;
-  }
-}
-
-class _OperationContext {
-  _OperationContext(this.id, this.lease, this.unregisterCancellation);
-
-  final int id;
-  final _OperationLease lease;
-  final void Function()? unregisterCancellation;
-}
-
-Stream<T> _withSubscriptionCancellation<T>(
-  MssqlCancellationToken? externalToken,
-  Stream<T> Function(MssqlCancellationToken token) create,
-) {
-  late StreamController<T> controller;
-  StreamSubscription<T>? subscription;
-  late MssqlCancellationToken operationToken;
-  void Function()? unregisterExternal;
-  // `await for` cancels its subscription after both early exit and failure.
-  // Only an early exit should cancel the command; after failure the connection
-  // may already be processing another operation.
-  var ended = false;
-
-  controller = StreamController<T>(
-    sync: true,
-    onListen: () {
-      operationToken = MssqlCancellationToken();
-      unregisterExternal = externalToken?.register(
-        () => operationToken.cancel(externalToken.reason),
-      );
-      subscription = create(operationToken).listen(
-        controller.add,
-        onError: (Object error, StackTrace stack) {
-          ended = true;
-          controller.addError(error, stack);
-        },
-        onDone: () {
-          ended = true;
-          unregisterExternal?.call();
-          controller.close();
-        },
-      );
-    },
-    onPause: () => subscription?.pause(),
-    onResume: () => subscription?.resume(),
-    onCancel: () async {
-      if (!ended) {
-        operationToken.cancel('Stream subscription was cancelled');
-      }
-      unregisterExternal?.call();
-      await subscription?.cancel();
-    },
-  );
-  return controller.stream;
-}
-
-class _ProcedureParameterMetadata {
-  const _ProcedureParameterMetadata({
-    required this.name,
-    required this.type,
-    required this.size,
-    required this.precision,
-    required this.scale,
-    required this.isOutput,
-    required this.isReadOnly,
-    this.tableTypeName,
-    this.tableTypeSchema,
-  });
-
-  final String name;
-  final MssqlType type;
-  final int size;
-  final int precision;
-  final int scale;
-  final bool isOutput;
-  final bool isReadOnly;
-
-  /// Set only for a table-valued parameter, naming the type to build.
-  final String? tableTypeName;
-  final String? tableTypeSchema;
-
-  bool get isTableType => tableTypeName != null;
-
-  String get quotedTableType => MssqlSql.quoteMultipartIdentifier(<String>[
-    tableTypeSchema ?? 'dbo',
-    tableTypeName!,
-  ]);
-}
-
-class _BulkColumnMetadata {
-  const _BulkColumnMetadata({
-    required this.column,
-    required this.identity,
-    required this.computed,
-    required this.hidden,
-    required this.rowVersion,
-  });
-
-  final MssqlBulkColumn column;
-  final bool identity;
-  final bool computed;
-  final bool hidden;
-  final bool rowVersion;
-}
 
 /// A single open connection to SQL Server.
 ///
@@ -208,9 +34,13 @@ class MssqlConnection with MssqlSession {
     this._worker,
     this._runtime, {
     MssqlMetadataCache? metadataCache,
+    required MssqlObservationDispatcher observationDispatcher,
   }) : _databaseName = _worker.databaseName,
+       _observationDispatcher = observationDispatcher,
+       connectionId = MssqlObservationDispatcher.newConnectionId(),
+       _lifetime = Stopwatch()..start(),
        _sessionState = MssqlSessionState(baselineDatabase: config.database),
-       metadataCache =
+       _metadataCache =
            metadataCache ??
            MssqlMetadataCache(
              maxEntries: config.metadataCacheSize,
@@ -220,13 +50,17 @@ class MssqlConnection with MssqlSession {
   @override
   final MssqlConnectionConfig config;
   final MssqlRuntime _runtime;
+  final MssqlObservationDispatcher _observationDispatcher;
+  final Stopwatch _lifetime;
   ConnectionWorker _worker;
-  final _OperationGate _operationGate = _OperationGate();
+  final OperationGate _operationGate = OperationGate();
   bool _closed = false;
+  bool _closeObserved = false;
   Future<void>? _closingFuture;
   bool _leasedByTransaction = false;
   bool? _hasHiddenColumnFlag;
   static int _tableParameterCounter = 0;
+  int _repairCount = 0;
 
   /// Reserved name for the return status of a procedure called through the
   /// table-valued path, where EXEC runs inside a batch.
@@ -237,10 +71,17 @@ class MssqlConnection with MssqlSession {
   int? _databaseCodePageCache;
   final MssqlSessionState _sessionState;
 
-  /// Shared procedure and bulk-table metadata for this server.
-  final MssqlMetadataCache metadataCache;
+  final MssqlMetadataCache _metadataCache;
 
   bool get isClosed => _closed || _worker.isClosed;
+  final int connectionId;
+  int get repairCount => _repairCount;
+
+  MssqlObservationTarget get _observationTarget => MssqlObservationTarget(
+    host: config.host,
+    port: config.port,
+    database: _databaseName,
+  );
 
   /// Whether this session holds state the driver cannot undo.
   ///
@@ -258,7 +99,7 @@ class MssqlConnection with MssqlSession {
 
   @override
   String get currentDatabase => _databaseName;
-  String get negotiatedTdsVersion => _tdsVersionName(_worker.negotiatedTdsCode);
+  String get negotiatedTdsVersion => tdsVersionName(_worker.negotiatedTdsCode);
 
   /// Invalidates one object's metadata, or all of it when omitted.
   ///
@@ -271,10 +112,10 @@ class MssqlConnection with MssqlSession {
   @override
   void invalidateMetadata({String? object}) {
     if (object == null) {
-      metadataCache.clear();
+      _metadataCache.clear();
     } else {
       final identifier = MssqlMultipartIdentifier.parse(object);
-      metadataCache.invalidateWhere(
+      _metadataCache.invalidateWhere(
         MssqlMetadataCache.objectMatcher(
           host: config.host,
           port: config.port,
@@ -291,7 +132,7 @@ class MssqlConnection with MssqlSession {
   ///
   /// The isolation level is set here rather than left to the server, so it is
   /// the driver's contract rather than whoever held the connection last.
-  static final List<String> sessionSetup = <String>[
+  static final List<String> _sessionSetup = <String>[
     'SET ARITHABORT ON',
     MssqlSessionState.isolationSql(MssqlSessionState.baselineIsolation),
   ];
@@ -311,6 +152,7 @@ class MssqlConnection with MssqlSession {
     String clientCharset = MssqlDefaults.clientCharset,
     MssqlEncryption encryption = MssqlDefaults.encryption,
     MssqlDecimalMode decimalMode = MssqlDefaults.decimalMode,
+    MssqlObserver? observer,
   }) => open(
     MssqlConnectionConfig(
       host: host,
@@ -327,6 +169,7 @@ class MssqlConnection with MssqlSession {
       encryption: encryption,
       decimalMode: decimalMode,
     ),
+    observer: observer,
   );
 
   /// Opens a connection as the Windows account running the process.
@@ -343,6 +186,7 @@ class MssqlConnection with MssqlSession {
     String clientCharset = MssqlDefaults.clientCharset,
     MssqlEncryption encryption = MssqlDefaults.encryption,
     MssqlDecimalMode decimalMode = MssqlDefaults.decimalMode,
+    MssqlObserver? observer,
   }) => open(
     MssqlConnectionConfig.integratedSecurity(
       host: host,
@@ -357,6 +201,7 @@ class MssqlConnection with MssqlSession {
       encryption: encryption,
       decimalMode: decimalMode,
     ),
+    observer: observer,
   );
 
   /// Opens a connection described by a .NET-style connection string.
@@ -367,122 +212,87 @@ class MssqlConnection with MssqlSession {
     String connectionString, {
     MssqlDecimalMode decimalMode = MssqlDefaults.decimalMode,
     void Function(List<String> keys)? onUnsupportedKeys,
+    MssqlObserver? observer,
   }) => open(
     MssqlConnectionConfig.fromConnectionString(
       connectionString,
       decimalMode: decimalMode,
       onUnsupportedKeys: onUnsupportedKeys,
     ),
+    observer: observer,
   );
 
   static Future<MssqlConnection> open(
     MssqlConnectionConfig config, {
     MssqlMetadataCache? metadataCache,
+    MssqlObserver? observer,
+  }) => _open(
+    config,
+    metadataCache: metadataCache,
+    observationDispatcher: MssqlObservationDispatcher(observer),
+  );
+
+  static Future<MssqlConnection> _open(
+    MssqlConnectionConfig config, {
+    MssqlMetadataCache? metadataCache,
+    required MssqlObservationDispatcher observationDispatcher,
   }) async {
+    final openWatch = observationDispatcher.enabled
+        ? (Stopwatch()..start())
+        : null;
     config.validate();
     final runtime = MssqlRuntime.instance;
     if (!runtime.isInitialized) await runtime.initialize();
-    _ensureTransportIsTrusted(config, runtime);
-    runtime.beginConnectionOpen();
+    ensureTransportIsTrusted(config, runtime);
+    mssqlBeginConnectionOpen(runtime);
     ConnectionWorker? worker;
     try {
       worker = await ConnectionWorker.open(
         config,
         runtime.sybdbPath,
-        runtime.handlersPath,
+        mssqlRuntimeHandlersPath(runtime),
       );
       final connection = MssqlConnection._(
         config,
         worker,
         runtime,
         metadataCache: metadataCache,
+        observationDispatcher: observationDispatcher,
       );
       await connection._applySessionSetup();
-      runtime.registerConnection(
+      mssqlRegisterConnection(
+        runtime,
         connection,
-        connection.closeForRuntimeShutdown,
+        connection._closeForRuntimeShutdown,
+      );
+      observationDispatcher.connectionOpen(
+        MssqlConnectionOpenEvent(
+          connectionId: connection.connectionId,
+          poolId: observationDispatcher.poolId,
+          target: connection._observationTarget,
+          elapsed: openWatch?.elapsed ?? Duration.zero,
+        ),
       );
       return connection;
     } on MssqlException catch (error, stack) {
       await worker?.close();
       Error.throwWithStackTrace(
-        _withLoginHandshakeHint(error, config, runtime),
+        withLoginHandshakeHint(error, config, runtime),
         stack,
       );
     } catch (_) {
       await worker?.close();
       rethrow;
     } finally {
-      runtime.endConnectionOpen();
+      mssqlEndConnectionOpen(runtime);
     }
-  }
-
-  /// Adds the one cause of a failed login that nothing else can report.
-  ///
-  /// TDS 7.1 and later encrypt the login packet whatever `encryption` says, so
-  /// a server that offers only TLS 1.0 there is refused during the handshake.
-  /// FreeTDS reports that as an ordinary "connection failed", which sends
-  /// people to look at firewalls and credentials. The hint is added only when
-  /// the configuration could actually be hitting it.
-  static MssqlException _withLoginHandshakeHint(
-    MssqlException error,
-    MssqlConnectionConfig config,
-    MssqlRuntime runtime,
-  ) {
-    if (error.type != MssqlErrorType.connection) return error;
-    if (config.tdsVersion == '7.0') return error;
-    if (runtime.allowLegacyTlsLogin) return error;
-    return MssqlException.classify(
-      type: error.type,
-      message:
-          '${error.message}\n'
-          'If the server is SQL Server 2014 or earlier without the TLS 1.2 '
-          'update, this is its login handshake being refused: TDS '
-          '${config.tdsVersion} encrypts the login packet, such a server '
-          'offers only TLS 1.0 there, and both FreeTDS and OpenSSL decline it '
-          'by default. Update the server, or initialize with '
-          'MssqlRuntime.instance.initialize(allowLegacyTlsLogin: true) — see '
-          'doc/TLS.md.',
-      code: error.code,
-      state: error.state,
-      retryable: error.retryable,
-      operationId: error.operationId,
-      queryName: error.queryName,
-      diagnostics: error.diagnostics,
-    );
-  }
-
-  /// Ensures encrypted connections have an explicit certificate trust policy.
-  static void _ensureTransportIsTrusted(
-    MssqlConnectionConfig config,
-    MssqlRuntime runtime,
-  ) {
-    if (config.encryption != MssqlEncryption.require &&
-        config.encryption != MssqlEncryption.strict) {
-      return;
-    }
-    if (runtime.tlsTrust != null) return;
-    throw MssqlTlsException(
-      'This connection asks for encryption (${config.encryption.name}) but '
-      'the process has no certificate trust configured, so FreeTDS would '
-      'encrypt the session and then accept any certificate the server '
-      'presented. Decide once, before the first connection:\n'
-      '  MssqlRuntime.instance.initialize(tls: MssqlTlsTrust('
-      "certificateAuthorityFile: '/path/to/ca.pem'))  // verify\n"
-      '  MssqlRuntime.instance.initialize(tls: MssqlTlsTrust.system())'
-      '                        // OpenSSL default paths\n'
-      '  MssqlRuntime.instance.initialize(tls: '
-      'MssqlTlsTrust.insecureNoVerification())    // encrypt, verify nothing\n'
-      'Or set encryption: MssqlEncryption.off to connect in the clear. '
-      'See doc/TLS.md.',
-    );
   }
 
   Future<void> _applySessionSetup() async {
-    if (sessionSetup.isEmpty) return;
+    if (_sessionSetup.isEmpty) return;
     await _runOperation<void>(null, (context) async {
       await _executeUnlocked(
-        command: sessionSetup.join('; '),
+        command: _sessionSetup.join('; '),
         procedure: false,
         parameters: const <MssqlParameterBinding>[],
         timeout: null,
@@ -531,12 +341,61 @@ class MssqlConnection with MssqlSession {
       maximumBytes: maximumBytes,
       retry: retry,
     );
-    return _execute(
-      command: sql,
-      procedure: false,
-      parameters: compileParameters(parameters),
-      options: settings,
+    final observation = _observationDispatcher.startQuery(
+      kind: MssqlQueryKind.query,
+      queryName: settings.queryName,
+      target: _observationTarget,
+      inTransaction: false,
+      connectionId: connectionId,
+      transactionId: null,
     );
+    return _runObservedQuery(
+      observation,
+      () => _queryCore(sql, parameters: parameters, options: settings),
+      retryAllowed: settings.retry != MssqlRetryPolicy.never,
+    );
+  }
+
+  Future<MssqlExecutionResult> _queryCore(
+    String sql, {
+    required Object parameters,
+    required MssqlQueryOptions options,
+    bool allowTransaction = false,
+  }) => _execute(
+    command: sql,
+    procedure: false,
+    parameters: compileParameters(parameters),
+    options: options,
+    allowTransaction: allowTransaction,
+  );
+
+  Future<MssqlExecutionResult> _runObservedQuery(
+    MssqlQueryObservation? observation,
+    Future<MssqlExecutionResult> Function() action, {
+    bool retryAllowed = false,
+  }) async {
+    if (observation != null) {
+      observation.connectionId = connectionId;
+      observation.repairCountAtStart = _repairCount;
+    }
+    try {
+      final result = await action();
+      if (retryAllowed &&
+          observation != null &&
+          _repairCount > observation.repairCountAtStart) {
+        observation.attemptCount = 2;
+      }
+      observation?.complete(result, _repairCount);
+      return result;
+    } catch (error, stack) {
+      if (retryAllowed &&
+          observation != null &&
+          _repairCount > observation.repairCountAtStart) {
+        observation.attemptCount = 2;
+      }
+      observation?.fail(error, _repairCount);
+      Error.throwWithStackTrace(error, stack);
+    }
   }
 
   @override
@@ -553,10 +412,7 @@ class MssqlConnection with MssqlSession {
     MssqlProcedureMetadata? declared,
     MssqlMetadataDriftPolicy driftPolicy =
         MssqlMetadataDriftPolicy.preferDeclared,
-    bool allowTransaction = false,
   }) {
-    // A procedure body is opaque to the driver: it may write, and rows coming
-    // back prove nothing about that. Retry stays off whatever the caller asked.
     final settings = options
         .merge(
           timeout: timeout,
@@ -566,6 +422,39 @@ class MssqlConnection with MssqlSession {
           maximumBytes: maximumBytes,
         )
         .withoutRetry;
+    final observation = _observationDispatcher.startQuery(
+      kind: MssqlQueryKind.procedure,
+      queryName: settings.queryName,
+      target: _observationTarget,
+      inTransaction: false,
+      connectionId: connectionId,
+      transactionId: null,
+    );
+    return _runObservedQuery(
+      observation,
+      () => _callProcedureCore(
+        procedure,
+        parameters: parameters,
+        outputParameters: outputParameters,
+        options: settings,
+        declared: declared,
+        driftPolicy: driftPolicy,
+      ),
+    );
+  }
+
+  Future<MssqlExecutionResult> _callProcedureCore(
+    String procedure, {
+    required Object parameters,
+    required Set<String> outputParameters,
+    required MssqlQueryOptions options,
+    required MssqlProcedureMetadata? declared,
+    required MssqlMetadataDriftPolicy driftPolicy,
+    bool allowTransaction = false,
+  }) {
+    // A procedure body is opaque to the driver: it may write, and rows coming
+    // back prove nothing about that. Retry stays off whatever the caller asked.
+    final settings = options.withoutRetry;
     final timeoutValue = settings.timeout;
     final queryNameValue = settings.queryName;
     final cancellationTokenValue = settings.cancellationToken;
@@ -605,7 +494,7 @@ class MssqlConnection with MssqlSession {
         declared: declared,
         driftPolicy: driftPolicy,
       );
-      final tables = _splitTableParameters(metadata, parameters);
+      final tables = splitTableParameters(metadata, parameters);
       if (tables.isNotEmpty) {
         return _callProcedureWithTablesUnlocked(
           identifier: identifier,
@@ -623,7 +512,7 @@ class MssqlConnection with MssqlSession {
           allowTransaction: allowTransaction,
         );
       }
-      final bindings = _compileProcedureParameters(
+      final bindings = compileProcedureParameters(
         metadata,
         parameters,
         outputParameters,
@@ -654,7 +543,6 @@ class MssqlConnection with MssqlSession {
     int? batchRows,
     int? maximumRows,
     int? maximumBytes,
-    bool allowTransaction = false,
   }) {
     final settings = options.merge(
       timeout: timeout,
@@ -663,8 +551,27 @@ class MssqlConnection with MssqlSession {
       maximumRows: maximumRows,
       maximumBytes: maximumBytes,
     );
+    if (!_observationDispatcher.enabled) {
+      return _streamCore(sql, parameters: parameters, options: settings);
+    }
+    return _observedStream(
+      kind: MssqlQueryKind.stream,
+      queryName: settings.queryName,
+      inTransaction: false,
+      transactionId: null,
+      create: () => _streamCore(sql, parameters: parameters, options: settings),
+    );
+  }
+
+  Stream<MssqlStreamEvent> _streamCore(
+    String sql, {
+    required Object parameters,
+    required MssqlQueryOptions options,
+    bool allowTransaction = false,
+  }) {
+    final settings = options;
     final bindings = compileParameters(parameters);
-    return _withSubscriptionCancellation(
+    return withSubscriptionCancellation(
       settings.cancellationToken,
       (operationToken) => _streamBindings(
         allowTransaction: allowTransaction,
@@ -681,6 +588,60 @@ class MssqlConnection with MssqlSession {
     );
   }
 
+  Stream<MssqlStreamEvent> _observedStream({
+    required MssqlQueryKind kind,
+    required String? queryName,
+    required bool inTransaction,
+    required int? transactionId,
+    required Stream<MssqlStreamEvent> Function() create,
+    MssqlQueryObservation? delegatedObservation,
+  }) async* {
+    final observation =
+        delegatedObservation ??
+        _observationDispatcher.startQuery(
+          kind: kind,
+          queryName: queryName,
+          target: _observationTarget,
+          inTransaction: inTransaction,
+          connectionId: connectionId,
+          transactionId: transactionId,
+        );
+    if (observation != null) {
+      observation.connectionId = connectionId;
+      observation.repairCountAtStart = _repairCount;
+    }
+    MssqlExecutionComplete? completion;
+    try {
+      await for (final event in create()) {
+        if (event is MssqlExecutionComplete) completion = event;
+        yield event;
+      }
+      final result = completion;
+      if (result != null) {
+        observation?.completeStream(result, _repairCount);
+      } else {
+        observation?.fail(
+          const MssqlCancelledException(
+            message: 'The SQL stream ended before execution completed.',
+          ),
+          _repairCount,
+        );
+      }
+    } catch (error, stack) {
+      observation?.fail(error, _repairCount);
+      Error.throwWithStackTrace(error, stack);
+    } finally {
+      if (observation != null && !observation.ended) {
+        observation.fail(
+          const MssqlCancelledException(
+            message: 'The SQL stream subscription was cancelled.',
+          ),
+          _repairCount,
+        );
+      }
+    }
+  }
+
   Stream<MssqlStreamEvent> streamProcedure(
     String procedure, {
     Object parameters = const <String, Object?>{},
@@ -691,7 +652,6 @@ class MssqlConnection with MssqlSession {
     int? batchRows,
     int? maximumRows,
     int? maximumBytes,
-    bool allowTransaction = false,
   }) {
     final settings = options.merge(
       timeout: timeout,
@@ -700,6 +660,36 @@ class MssqlConnection with MssqlSession {
       maximumRows: maximumRows,
       maximumBytes: maximumBytes,
     );
+    if (!_observationDispatcher.enabled) {
+      return _streamProcedureCore(
+        procedure,
+        parameters: parameters,
+        outputParameters: outputParameters,
+        options: settings,
+      );
+    }
+    return _observedStream(
+      kind: MssqlQueryKind.stream,
+      queryName: settings.queryName,
+      inTransaction: false,
+      transactionId: null,
+      create: () => _streamProcedureCore(
+        procedure,
+        parameters: parameters,
+        outputParameters: outputParameters,
+        options: settings,
+      ),
+    );
+  }
+
+  Stream<MssqlStreamEvent> _streamProcedureCore(
+    String procedure, {
+    required Object parameters,
+    required Set<String> outputParameters,
+    required MssqlQueryOptions options,
+    bool allowTransaction = false,
+  }) {
+    final settings = options;
     if (parameters is Iterable) {
       if (outputParameters.isNotEmpty) {
         throw ArgumentError(
@@ -708,7 +698,7 @@ class MssqlConnection with MssqlSession {
         );
       }
       final bindings = compileParameters(parameters);
-      return _withSubscriptionCancellation(
+      return withSubscriptionCancellation(
         settings.cancellationToken,
         (operationToken) => _streamBindings(
           allowTransaction: allowTransaction,
@@ -732,7 +722,7 @@ class MssqlConnection with MssqlSession {
       );
     }
     final identifier = MssqlMultipartIdentifier.parse(procedure);
-    return _withSubscriptionCancellation(
+    return withSubscriptionCancellation(
       settings.cancellationToken,
       (operationToken) => _streamProcedureBindings(
         allowTransaction: allowTransaction,
@@ -766,7 +756,7 @@ class MssqlConnection with MssqlSession {
     final context = await _beginOperation(cancellationToken);
     try {
       final metadata = await _procedureMetadata(identifier);
-      final bindings = _compileProcedureParameters(
+      final bindings = compileProcedureParameters(
         metadata,
         parameters,
         outputParameters,
@@ -785,7 +775,7 @@ class MssqlConnection with MssqlSession {
         queryName: queryName,
       );
     } catch (_) {
-      cancellationToken.throwIfCancelled();
+      mssqlThrowIfCancelled(cancellationToken);
       rethrow;
     } finally {
       _endOperation(context);
@@ -820,7 +810,7 @@ class MssqlConnection with MssqlSession {
         queryName: queryName,
       );
     } catch (_) {
-      cancellationToken?.throwIfCancelled();
+      mssqlThrowIfCancelled(cancellationToken);
       rethrow;
     } finally {
       _endOperation(context);
@@ -841,7 +831,7 @@ class MssqlConnection with MssqlSession {
     String? queryName,
   }) async* {
     _ensureAvailable(allowTransaction: allowTransaction);
-    _validateQueryLimits(
+    validateQueryLimits(
       command,
       batchRows: batchRows,
       maximumRows: maximumRows,
@@ -868,7 +858,7 @@ class MssqlConnection with MssqlSession {
       opened = true;
       var setIndex = 0;
       while (true) {
-        cancellationToken?.throwIfCancelled();
+        mssqlThrowIfCancelled(cancellationToken);
         final columns = await worker.nextResult();
         if (columns == null) break;
         final schema = MssqlRowSchema(columns);
@@ -877,7 +867,7 @@ class MssqlConnection with MssqlSession {
         var bytes = 0;
         yield MssqlResultSetStart(index: setIndex, columns: schema.columns);
         while (true) {
-          cancellationToken?.throwIfCancelled();
+          mssqlThrowIfCancelled(cancellationToken);
           final values = await worker.fetchBatch(batchRows);
           if (values == null) break;
           if (values.isNotEmpty && firstRow == null) {
@@ -886,7 +876,7 @@ class MssqlConnection with MssqlSession {
           final batch = <MssqlRow>[];
           for (final valueRow in values) {
             rows++;
-            final size = _decodedRowBytes(valueRow);
+            final size = decodedRowBytes(valueRow);
             bytes += size;
             batch.add(MssqlRow.fromValues(schema, valueRow));
           }
@@ -990,7 +980,7 @@ class MssqlConnection with MssqlSession {
         await _repairIfProcessIsDead(error, allowTransaction: allowTransaction);
         rethrow;
       }
-      options.cancellationToken?.throwIfCancelled();
+      mssqlThrowIfCancelled(options.cancellationToken);
       await _reconnectUnlocked();
       return _executeUnlocked(
         command: command,
@@ -1021,7 +1011,7 @@ class MssqlConnection with MssqlSession {
     String? queryName,
   }) async {
     _ensureAvailable(allowTransaction: allowTransaction);
-    _validateQueryLimits(
+    validateQueryLimits(
       command,
       batchRows: batchRows,
       maximumRows: maximumRows,
@@ -1061,7 +1051,7 @@ class MssqlConnection with MssqlSession {
             firstRow = execution.elapsed;
           }
           for (final row in batch) {
-            decodedBytes += _decodedRowBytes(row);
+            decodedBytes += decodedRowBytes(row);
           }
           values.addAll(batch);
         }
@@ -1121,7 +1111,7 @@ class MssqlConnection with MssqlSession {
   }
 
   /// Runs a command on a transaction-held connection with retries disabled.
-  Future<MssqlExecutionResult> executeWithinTransaction(
+  Future<MssqlExecutionResult> _executeWithinTransaction(
     String command, {
     Object parameters = const <String, Object?>{},
     MssqlQueryOptions options = MssqlQueryOptions.defaults,
@@ -1137,39 +1127,72 @@ class MssqlConnection with MssqlSession {
   Future<MssqlTransaction> beginTransaction({
     MssqlIsolationLevel isolationLevel = MssqlIsolationLevel.baseline,
     MssqlCancellationToken? cancellationToken,
-  }) => _runOperation<MssqlTransaction>(cancellationToken, (_) async {
-    _ensureAvailable();
-    _leasedByTransaction = true;
-    // What the session is at now, recorded before it moves, so that commit,
-    // rollback and close all have the same thing to put back.
-    final previous = _sessionState.isolation;
-    final wanted = isolationLevel == MssqlIsolationLevel.baseline
-        ? MssqlSessionState.baselineIsolation
-        : isolationLevel;
+    String? transactionName,
+  }) {
+    final observation = _observationDispatcher.startTransaction(
+      transactionName: transactionName,
+      target: _observationTarget,
+      connectionId: connectionId,
+    );
+    return _beginTransactionCore(
+      isolationLevel: isolationLevel,
+      cancellationToken: cancellationToken,
+      observation: observation,
+    );
+  }
+
+  Future<MssqlTransaction> _beginTransactionCore({
+    required MssqlIsolationLevel isolationLevel,
+    required MssqlCancellationToken? cancellationToken,
+    required MssqlTransactionObservation? observation,
+  }) async {
     try {
-      final prelude = wanted == previous
-          ? ''
-          : '${MssqlSessionState.isolationSql(wanted)} ';
-      await _worker.runSql(
-        '${prelude}BEGIN TRANSACTION;',
-        config.defaultQueryTimeout,
-      );
-      _sessionState.recordIsolation(wanted);
-      return MssqlTransaction.internal(this, _worker);
-    } catch (_) {
-      _leasedByTransaction = false;
-      rethrow;
+      return await _runOperation<MssqlTransaction>(cancellationToken, (
+        _,
+      ) async {
+        _ensureAvailable();
+        _leasedByTransaction = true;
+        // What the session is at now, recorded before it moves, so that commit,
+        // rollback and close all have the same thing to put back.
+        final previous = _sessionState.isolation;
+        final wanted = isolationLevel == MssqlIsolationLevel.baseline
+            ? MssqlSessionState.baselineIsolation
+            : isolationLevel;
+        try {
+          final prelude = wanted == previous
+              ? ''
+              : '${MssqlSessionState.isolationSql(wanted)} ';
+          await _worker.runSql(
+            '${prelude}BEGIN TRANSACTION;',
+            config.defaultQueryTimeout,
+          );
+          _sessionState.recordIsolation(wanted);
+          return mssqlCreateTransaction(
+            this,
+            _worker,
+            observation: observation,
+          );
+        } catch (_) {
+          _leasedByTransaction = false;
+          rethrow;
+        }
+      });
+    } catch (error, stack) {
+      observation?.fail(error, MssqlTransactionSettlement.unknown);
+      Error.throwWithStackTrace(error, stack);
     }
-  });
+  }
 
   Future<T> transaction<T>(
     Future<T> Function(MssqlTransaction transaction) callback, {
     MssqlIsolationLevel isolationLevel = MssqlIsolationLevel.baseline,
     MssqlCancellationToken? cancellationToken,
+    String? transactionName,
   }) async {
     final transaction = await beginTransaction(
       isolationLevel: isolationLevel,
       cancellationToken: cancellationToken,
+      transactionName: transactionName,
     );
     try {
       final value = await callback(transaction);
@@ -1179,9 +1202,7 @@ class MssqlConnection with MssqlSession {
     } catch (error, stack) {
       // Cleanup must not replace the failure being diagnosed, so a failing
       // rollback or close is swallowed.
-      try {
-        await transaction.rollback();
-      } catch (_) {}
+      await mssqlRollbackAfterCallbackError(transaction, error);
       try {
         await transaction.close();
       } catch (_) {}
@@ -1241,10 +1262,38 @@ SELECT
     MssqlBulkOptions options = const MssqlBulkOptions(),
     MssqlCancellationToken? cancellationToken,
     void Function(int sentRows)? onProgress,
+  }) {
+    final observation = _observationDispatcher.startBulk(
+      bulkName: options.bulkName,
+      target: _observationTarget,
+      inTransaction: false,
+      connectionId: connectionId,
+      transactionId: null,
+    );
+    return _runObservedBulk(
+      observation,
+      () => _bulkInsertCore(
+        tableName: tableName,
+        rows: rows,
+        columns: columns,
+        options: options,
+        cancellationToken: cancellationToken,
+        onProgress: onProgress,
+      ),
+    );
+  }
+
+  Future<MssqlBulkResult> _bulkInsertCore({
+    required String tableName,
+    required Iterable<Object> rows,
+    Object? columns,
+    required MssqlBulkOptions options,
+    MssqlCancellationToken? cancellationToken,
+    void Function(int sentRows)? onProgress,
     bool allowTransaction = false,
   }) {
     if (columns is List<MssqlBulkColumn>) {
-      return bulkInsertRaw(
+      return _bulkInsertRawCore(
         tableName: tableName,
         columns: columns,
         rows: rows.map((row) {
@@ -1297,10 +1346,10 @@ SELECT
     return _runOperation<MssqlBulkResult>(cancellationToken, (_) async {
       _ensureAvailable(allowTransaction: allowTransaction);
       final metadata = await _tableMetadata(table);
-      final byName = <String, _BulkColumnMetadata>{
+      final byName = <String, BulkColumnMetadata>{
         for (final item in metadata) item.column.name: item,
       };
-      final chosen = <_BulkColumnMetadata>[];
+      final chosen = <BulkColumnMetadata>[];
       for (final name in selected) {
         final item = byName[name];
         if (item == null) {
@@ -1333,10 +1382,10 @@ SELECT
         var rowIndex = 0;
         var current = first;
         while (true) {
-          _validateBulkKeys(current, selected, rowIndex);
+          validateBulkKeys(current, selected, rowIndex);
           yield <MssqlValue>[
             for (final item in chosen)
-              _bulkValue(current[item.column.name], item.column, rowIndex),
+              bulkValue(current[item.column.name], item.column, rowIndex),
           ];
           rowIndex++;
           if (!iterator.moveNext()) break;
@@ -1362,11 +1411,39 @@ SELECT
     MssqlBulkOptions options = const MssqlBulkOptions(),
     MssqlCancellationToken? cancellationToken,
     void Function(int sentRows)? onProgress,
+  }) {
+    final observation = _observationDispatcher.startBulk(
+      bulkName: options.bulkName,
+      target: _observationTarget,
+      inTransaction: false,
+      connectionId: connectionId,
+      transactionId: null,
+    );
+    return _runObservedBulk(
+      observation,
+      () => _bulkInsertRawCore(
+        tableName: tableName,
+        columns: columns,
+        rows: rows,
+        options: options,
+        cancellationToken: cancellationToken,
+        onProgress: onProgress,
+      ),
+    );
+  }
+
+  Future<MssqlBulkResult> _bulkInsertRawCore({
+    required String tableName,
+    required List<MssqlBulkColumn> columns,
+    required Iterable<List<Object?>> rows,
+    required MssqlBulkOptions options,
+    MssqlCancellationToken? cancellationToken,
+    void Function(int sentRows)? onProgress,
     bool allowTransaction = false,
   }) {
     final table = MssqlMultipartIdentifier.parse(tableName);
     options.validate();
-    _validateRawBulkColumns(columns);
+    validateRawBulkColumns(columns);
     return _runOperation<MssqlBulkResult>(cancellationToken, (_) async {
       _ensureAvailable(allowTransaction: allowTransaction);
       Iterable<List<MssqlValue>> converted() sync* {
@@ -1382,7 +1459,7 @@ SELECT
           }
           yield <MssqlValue>[
             for (var index = 0; index < columns.length; index++)
-              _bulkValue(row[index], columns[index], rowIndex),
+              bulkValue(row[index], columns[index], rowIndex),
           ];
           rowIndex++;
         }
@@ -1399,6 +1476,21 @@ SELECT
     });
   }
 
+  Future<MssqlBulkResult> _runObservedBulk(
+    MssqlBulkObservation? observation,
+    Future<MssqlBulkResult> Function() action,
+  ) async {
+    if (observation != null) observation.connectionId = connectionId;
+    try {
+      final result = await action();
+      observation?.complete(result, _repairCount);
+      return result;
+    } catch (error, stack) {
+      observation?.fail(error, _repairCount);
+      Error.throwWithStackTrace(error, stack);
+    }
+  }
+
   Future<MssqlBulkResult> _runBulkUnlocked({
     required String table,
     required List<MssqlBulkColumn> columns,
@@ -1409,7 +1501,7 @@ SELECT
   }) async {
     final iterator = rows.iterator;
     if (!iterator.moveNext()) return MssqlBulkResult.empty;
-    final codePage = columns.any((column) => _isSingleByteText(column.type))
+    final codePage = columns.any((column) => isSingleByteText(column.type))
         ? await _databaseCodePageUnlocked()
         : 0;
     final worker = _worker;
@@ -1425,7 +1517,7 @@ SELECT
     var hasMore = true;
     try {
       while (hasMore) {
-        cancellationToken?.throwIfCancelled();
+        mssqlThrowIfCancelled(cancellationToken);
         final chunk = <List<MssqlValue>>[];
         while (chunk.length < 128) {
           chunk.add(current);
@@ -1478,45 +1570,13 @@ SELECT
   ///
   /// A value is a table only when the procedure says the parameter is one, so
   /// an ordinary list bound to a scalar parameter still fails as it did.
-  static Map<String, MssqlTableRows> _splitTableParameters(
-    List<_ProcedureParameterMetadata> metadata,
-    Map<String, Object?> parameters,
-  ) {
-    final tableParameters = <String, _ProcedureParameterMetadata>{
-      for (final item in metadata)
-        if (item.isTableType) item.name: item,
-    };
-    if (tableParameters.isEmpty) return const <String, MssqlTableRows>{};
-    final tables = <String, MssqlTableRows>{};
-    for (final entry in parameters.entries) {
-      final name = normalizeParameterName(entry.key);
-      if (!tableParameters.containsKey(name)) continue;
-      final value = entry.value;
-      if (value is MssqlTableRows) {
-        tables[name] = value;
-        continue;
-      }
-      if (value is Iterable<Map<String, Object?>>) {
-        tables[name] = MssqlTableRows(value);
-        continue;
-      }
-      throw ArgumentError.value(
-        value,
-        name,
-        'Parameter "$name" is a table type. Pass MssqlTableRows or an '
-        'Iterable<Map<String, Object?>>.',
-      );
-    }
-    return tables;
-  }
-
   /// Calls a procedure containing table-valued parameters.
   ///
   /// FreeTDS lacks TVP wire support, so rows are bulk-copied into a temporary
   /// table and transferred to a variable of the declared table type.
   Future<MssqlExecutionResult> _callProcedureWithTablesUnlocked({
     required MssqlMultipartIdentifier identifier,
-    required List<_ProcedureParameterMetadata> metadata,
+    required List<ProcedureParameterMetadata> metadata,
     required Map<String, MssqlTableRows> tables,
     required Map<String, Object?> parameters,
     required Set<String> outputParameters,
@@ -1534,12 +1594,12 @@ SELECT
         if (!tables.containsKey(normalizeParameterName(entry.key)))
           entry.key: entry.value,
     };
-    final scalarMetadata = <_ProcedureParameterMetadata>[
+    final scalarMetadata = <ProcedureParameterMetadata>[
       for (final item in metadata)
         if (!item.isTableType) item,
     ];
     final bindings = <MssqlParameterBinding>[
-      ..._compileProcedureParameters(scalarMetadata, scalars, outputParameters),
+      ...compileProcedureParameters(scalarMetadata, scalars, outputParameters),
       // The return status is an ordinary OUTPUT parameter here: EXEC inside a
       // batch does not reach dbretstatus.
       MssqlParameterBinding.fromValue(
@@ -1638,7 +1698,7 @@ SELECT
 
   /// Builds the staging table for one table-valued parameter and fills it.
   Future<void> _stageTableParameterUnlocked(
-    _ProcedureParameterMetadata parameter,
+    ProcedureParameterMetadata parameter,
     String table,
     MssqlTableRows rows,
   ) async {
@@ -1673,10 +1733,10 @@ SELECT
     Iterable<List<MssqlValue>> converted() sync* {
       var rowIndex = 0;
       for (final row in rows.rows) {
-        _validateBulkKeys(row, names, rowIndex);
+        validateBulkKeys(row, names, rowIndex);
         yield <MssqlValue>[
           for (final column in columns)
-            _bulkValue(row[column.name], column, rowIndex),
+            bulkValue(row[column.name], column, rowIndex),
         ];
         rowIndex++;
       }
@@ -1694,26 +1754,10 @@ SELECT
 
   /// The columns of a table type, in the order the type declares them.
   Future<List<MssqlBulkColumn>> _tableTypeColumnsUnlocked(
-    _ProcedureParameterMetadata parameter,
+    ProcedureParameterMetadata parameter,
   ) async {
     final result = await _executeUnlocked(
-      command: '''
-SELECT
-  c.column_id,
-  c.name,
-  t.name AS type_name,
-  c.max_length,
-  c.precision,
-  c.scale,
-  c.is_nullable
-FROM sys.table_types AS tt
-JOIN sys.columns AS c ON c.object_id = tt.type_table_object_id
-JOIN sys.types AS t
-  ON t.system_type_id = c.system_type_id
- AND t.user_type_id = t.system_type_id
-WHERE tt.name = @type_name AND SCHEMA_NAME(tt.schema_id) = @type_schema
-ORDER BY c.column_id;
-''',
+      command: tableTypeColumnsSql,
       procedure: false,
       parameters: compileParameters(<String, Object?>{
         'type_name': MssqlValue.nvarchar(parameter.tableTypeName, size: 128),
@@ -1730,35 +1774,21 @@ ORDER BY c.column_id;
       allowTransaction: true,
       queryName: 'mssql_native.tableTypeColumns',
     );
-    if (result.resultSets.isEmpty) return const <MssqlBulkColumn>[];
-    return result.resultSets.first.typedRows
-        .map((row) {
-          final type = _typeFromSqlName(row.require<String>('type_name'));
-          return MssqlBulkColumn(
-            ordinal: row.require<int>('column_id'),
-            name: row.require<String>('name'),
-            type: type,
-            size: _metadataSize(type, row.require<int>('max_length')),
-            precision: row.require<int>('precision'),
-            scale: row.require<int>('scale'),
-            nullable: row.require<bool>('is_nullable'),
-          );
-        })
-        .toList(growable: false);
+    return decodeTableTypeColumns(result);
   }
 
-  Future<List<_ProcedureParameterMetadata>> _procedureMetadata(
+  Future<List<ProcedureParameterMetadata>> _procedureMetadata(
     MssqlMultipartIdentifier procedure, {
     MssqlProcedureMetadata? declared,
     MssqlMetadataDriftPolicy driftPolicy =
         MssqlMetadataDriftPolicy.preferDeclared,
   }) async {
     if (declared != null) {
-      _assertDeclaredIsFor(identifier: procedure, declared: declared);
+      assertDeclaredIsFor(identifier: procedure, declared: declared);
     }
     if (declared != null &&
         driftPolicy == MssqlMetadataDriftPolicy.preferDeclared) {
-      return _procedureMetadataFromDeclared(declared);
+      return procedureMetadataFromDeclared(declared);
     }
     final key = MssqlMetadataCache.key(
       host: config.host,
@@ -1767,13 +1797,13 @@ ORDER BY c.column_id;
       object: 'proc:${procedure.quoted}',
       schemaVersion: declared?.schemaVersion ?? '',
     );
-    final live = await metadataCache.getOrLoad(
+    final live = await _metadataCache.getOrLoad(
       key,
       () => _procedureMetadataUnlocked(procedure),
     );
     if (declared != null &&
         driftPolicy == MssqlMetadataDriftPolicy.verifyDeclared) {
-      _assertProcedureMetadata(declared, live);
+      assertProcedureMetadata(declared, live);
     }
     return live;
   }
@@ -1784,103 +1814,7 @@ ORDER BY c.column_id;
   /// description of the call. The wrong one binds this procedure's arguments
   /// with another's types, sizes and directions. The name is what can be
   /// checked without a catalog query.
-  void _assertDeclaredIsFor({
-    required MssqlMultipartIdentifier identifier,
-    required MssqlProcedureMetadata declared,
-  }) {
-    final MssqlMultipartIdentifier parsed;
-    try {
-      parsed = MssqlMultipartIdentifier.parse(declared.procedure);
-    } on ArgumentError {
-      throw MssqlException(
-        type: MssqlErrorType.configuration,
-        message:
-            'MssqlProcedureMetadata.procedure is '
-            '"${declared.procedure}", which is not a SQL identifier. It names '
-            'the procedure the declaration describes, and is compared against '
-            'the one being called.',
-      );
-    }
-    // Compared on the trailing parts both names have, so `create_label`
-    // matches `dbo.create_label` but `sales.create_label` does not.
-    final a = identifier.parts;
-    final b = parsed.parts;
-    final shared = a.length < b.length ? a.length : b.length;
-    for (var i = 1; i <= shared; i++) {
-      if (a[a.length - i].toLowerCase() != b[b.length - i].toLowerCase()) {
-        throw MssqlException(
-          type: MssqlErrorType.configuration,
-          message:
-              'The declared metadata describes "${declared.procedure}", but '
-              'this call is to "${identifier.quoted}". Passing one '
-              'procedure\'s declaration to another binds its arguments with '
-              'the wrong types, sizes and directions.',
-        );
-      }
-    }
-  }
-
-  List<_ProcedureParameterMetadata> _procedureMetadataFromDeclared(
-    MssqlProcedureMetadata declared,
-  ) {
-    return <_ProcedureParameterMetadata>[
-      for (final parameter in declared.parameters)
-        _ProcedureParameterMetadata(
-          name: normalizeParameterName(parameter.name),
-          type: parameter.type,
-          size: parameter.size,
-          precision: parameter.precision,
-          scale: parameter.scale,
-          isOutput: parameter.isOutput,
-          isReadOnly: parameter.isReadOnly || parameter.tableTypeName != null,
-          tableTypeName: parameter.tableTypeName,
-          tableTypeSchema: parameter.tableTypeSchema,
-        ),
-    ];
-  }
-
-  void _assertProcedureMetadata(
-    MssqlProcedureMetadata declared,
-    List<_ProcedureParameterMetadata> live,
-  ) {
-    final expected = _procedureMetadataFromDeclared(declared);
-    if (expected.length != live.length) {
-      throw MssqlException(
-        type: MssqlErrorType.configuration,
-        message:
-            'Procedure "${declared.procedure}" has ${live.length} parameter(s) '
-            'on the server and ${expected.length} in generated metadata. '
-            'Regenerate against the live procedure, or pass '
-            'driftPolicy: MssqlMetadataDriftPolicy.alwaysDescribe.',
-      );
-    }
-    for (var i = 0; i < live.length; i++) {
-      final a = expected[i];
-      final b = live[i];
-      if (a.name == b.name &&
-          a.type == b.type &&
-          a.size == b.size &&
-          a.precision == b.precision &&
-          a.scale == b.scale &&
-          a.isOutput == b.isOutput &&
-          a.tableTypeName == b.tableTypeName &&
-          a.tableTypeSchema == b.tableTypeSchema) {
-        continue;
-      }
-      throw MssqlException(
-        type: MssqlErrorType.configuration,
-        message:
-            'Procedure "${declared.procedure}" parameter "${b.name}" does not '
-            'match generated metadata. The server has ${b.type.name} '
-            '(size ${b.size}, precision ${b.precision}, scale ${b.scale}); '
-            'generation has ${a.type.name} (size ${a.size}, precision '
-            '${a.precision}, scale ${a.scale}). Regenerate, or pass '
-            'driftPolicy: MssqlMetadataDriftPolicy.alwaysDescribe.',
-      );
-    }
-  }
-
-  Future<List<_BulkColumnMetadata>> _tableMetadata(
+  Future<List<BulkColumnMetadata>> _tableMetadata(
     MssqlMultipartIdentifier table,
   ) {
     final key = MssqlMetadataCache.key(
@@ -1889,48 +1823,17 @@ ORDER BY c.column_id;
       database: _databaseName,
       object: 'table:${table.quoted}',
     );
-    return metadataCache.getOrLoad(key, () => _tableMetadataUnlocked(table));
+    return _metadataCache.getOrLoad(key, () => _tableMetadataUnlocked(table));
   }
 
-  Future<List<_ProcedureParameterMetadata>> _procedureMetadataUnlocked(
+  Future<List<ProcedureParameterMetadata>> _procedureMetadataUnlocked(
     MssqlMultipartIdentifier procedure,
   ) async {
     final catalog = procedure.parts.length == 3
         ? '${MssqlSql.quoteIdentifier(procedure.parts.first)}.'
         : '';
     final result = await _executeUnlocked(
-      command:
-          '''
-DECLARE @object_id int = OBJECT_ID(@procedure, 'P');
-IF @object_id IS NULL
-BEGIN
-  RAISERROR('Stored procedure was not found.', 16, 1);
-  RETURN;
-END;
-SELECT
-  p.name,
-  COALESCE(t.name, user_type.name) AS type_name,
-  user_type.name AS user_type_name,
-  SCHEMA_NAME(user_type.schema_id) AS user_type_schema,
-  p.max_length,
-  p.precision,
-  p.scale,
-  p.is_output,
-  p.is_readonly,
-  user_type.is_table_type
-FROM ${catalog}sys.parameters AS p
-JOIN ${catalog}sys.types AS user_type
-  ON user_type.user_type_id = p.user_type_id
--- LEFT, because a table type has no base row here: an inner join dropped the
--- parameter entirely, and the caller was told the procedure had no such
--- parameter instead of that table-valued parameters are not supported.
-LEFT JOIN ${catalog}sys.types AS t
-  ON t.system_type_id = p.system_type_id
- AND t.user_type_id = t.system_type_id
-WHERE p.object_id = @object_id
-  AND p.parameter_id > 0
-ORDER BY p.parameter_id;
-''',
+      command: procedureMetadataSql(catalog),
       procedure: false,
       parameters: compileParameters(<String, Object?>{
         'procedure': MssqlValue.nvarchar(procedure.quoted, size: 776),
@@ -1943,101 +1846,7 @@ ORDER BY p.parameter_id;
       allowTransaction: true,
       queryName: 'mssql_native.procedureMetadata',
     );
-    if (result.resultSets.isEmpty) return const <_ProcedureParameterMetadata>[];
-    return result.resultSets.first.typedRows
-        .map((row) {
-          final rawName = row.require<String>('name');
-          final isTableType = row.require<bool>('is_table_type');
-          // A table type has no Dart-side equivalent; it is kept in the list
-          // only so that naming it produces the unsupported-type error rather
-          // than "no such parameter".
-          final type = isTableType
-              ? MssqlType.nvarchar
-              : _typeFromSqlName(row.require<String>('type_name'));
-          return _ProcedureParameterMetadata(
-            name: normalizeParameterName(rawName),
-            type: type,
-            size: _metadataSize(type, row.require<int>('max_length')),
-            precision: row.require<int>('precision'),
-            scale: row.require<int>('scale'),
-            isOutput: row.require<bool>('is_output'),
-            isReadOnly: row.require<bool>('is_readonly') || isTableType,
-            tableTypeName: isTableType
-                ? row.require<String>('user_type_name')
-                : null,
-            tableTypeSchema: isTableType
-                ? row.require<String>('user_type_schema')
-                : null,
-          );
-        })
-        .toList(growable: false);
-  }
-
-  List<MssqlParameterBinding> _compileProcedureParameters(
-    List<_ProcedureParameterMetadata> metadata,
-    Map<String, Object?> parameters,
-    Set<String> outputParameters,
-  ) {
-    final inputs = <String, Object?>{};
-    for (final entry in parameters.entries) {
-      final name = normalizeParameterName(entry.key);
-      if (inputs.containsKey(name)) {
-        throw ArgumentError('Duplicate procedure parameter "$name".');
-      }
-      inputs[name] = entry.value;
-    }
-    final outputs = outputParameters.map(normalizeParameterName).toSet();
-    final known = metadata.map((item) => item.name).toSet();
-    for (final name in <String>{...inputs.keys, ...outputs}) {
-      if (!known.contains(name)) {
-        throw ArgumentError('The procedure has no parameter named "$name".');
-      }
-    }
-
-    final bindings = <MssqlParameterBinding>[];
-    for (final item in metadata) {
-      final hasInput = inputs.containsKey(item.name);
-      final wantsOutput = outputs.contains(item.name);
-      if (!hasInput && !wantsOutput) continue;
-      if (item.isReadOnly) {
-        throw MssqlException(
-          type: MssqlErrorType.unsupportedType,
-          message: 'Table-valued parameter "${item.name}" is not supported.',
-        );
-      }
-      if (wantsOutput && !item.isOutput) {
-        throw ArgumentError(
-          'Procedure parameter "${item.name}" is not declared OUTPUT.',
-        );
-      }
-      final raw = hasInput ? inputs[item.name] : null;
-      final value = wantsOutput
-          ? coerceMssqlValue(
-              raw is MssqlValue ? raw.value : raw,
-              type: item.type,
-              size: item.size,
-              precision: item.precision,
-              scale: item.scale,
-            )
-          : (raw is MssqlValue
-                ? raw.validated()
-                : coerceMssqlValue(
-                    raw,
-                    type: item.type,
-                    size: item.size,
-                    precision: item.precision,
-                    scale: item.scale,
-                  ));
-      final direction = wantsOutput
-          ? (hasInput
-                ? MssqlParameterBindingDirection.inputOutput
-                : MssqlParameterBindingDirection.output)
-          : MssqlParameterBindingDirection.input;
-      bindings.add(
-        MssqlParameterBinding.fromValue(item.name, value, direction: direction),
-      );
-    }
-    return bindings;
+    return decodeProcedureMetadata(result);
   }
 
   /// Whether `sys.columns` on this server has an `is_hidden` column.
@@ -2071,7 +1880,7 @@ ORDER BY p.parameter_id;
     return present;
   }
 
-  Future<List<_BulkColumnMetadata>> _tableMetadataUnlocked(
+  Future<List<BulkColumnMetadata>> _tableMetadataUnlocked(
     MssqlMultipartIdentifier table,
   ) async {
     final catalog = table.parts.length == 3
@@ -2081,34 +1890,7 @@ ORDER BY p.parameter_id;
         ? 'c.is_hidden'
         : 'CAST(0 AS bit)';
     final result = await _executeUnlocked(
-      command:
-          '''
-DECLARE @object_id int = OBJECT_ID(@table, 'U');
-IF @object_id IS NULL
-BEGIN
-  RAISERROR('Bulk destination table was not found.', 16, 1);
-  RETURN;
-END;
-SELECT
-  c.column_id,
-  c.name,
-  t.name AS type_name,
-  c.max_length,
-  c.precision,
-  c.scale,
-  c.is_nullable,
-  c.is_identity,
-  c.is_computed,
-  $hidden AS is_hidden
-FROM ${catalog}sys.columns AS c
-JOIN ${catalog}sys.types AS user_type
-  ON user_type.user_type_id = c.user_type_id
-JOIN ${catalog}sys.types AS t
-  ON t.system_type_id = c.system_type_id
- AND t.user_type_id = t.system_type_id
-WHERE c.object_id = @object_id
-ORDER BY c.column_id;
-''',
+      command: tableMetadataSql(catalog: catalog, hidden: hidden),
       procedure: false,
       parameters: compileParameters(<String, Object?>{
         'table': MssqlValue.nvarchar(table.quoted, size: 776),
@@ -2121,32 +1903,7 @@ ORDER BY c.column_id;
       allowTransaction: true,
       queryName: 'mssql_native.bulkTableMetadata',
     );
-    if (result.resultSets.isEmpty) return const <_BulkColumnMetadata>[];
-    return result.resultSets.first.typedRows
-        .map((row) {
-          final typeName = row.require<String>('type_name');
-          final rowVersion =
-              typeName == 'timestamp' || typeName == 'rowversion';
-          final type = rowVersion
-              ? MssqlType.varbinary
-              : _typeFromSqlName(typeName);
-          return _BulkColumnMetadata(
-            column: MssqlBulkColumn(
-              ordinal: row.require<int>('column_id'),
-              name: row.require<String>('name'),
-              type: type,
-              size: _metadataSize(type, row.require<int>('max_length')),
-              precision: row.require<int>('precision'),
-              scale: row.require<int>('scale'),
-              nullable: row.require<bool>('is_nullable'),
-            ),
-            identity: row.require<bool>('is_identity'),
-            computed: row.require<bool>('is_computed'),
-            hidden: row.require<bool>('is_hidden'),
-            rowVersion: rowVersion,
-          );
-        })
-        .toList(growable: false);
+    return decodeTableMetadata(result);
   }
 
   Future<int> _databaseCodePageUnlocked() async {
@@ -2177,20 +1934,20 @@ ORDER BY c.column_id;
 
   Future<T> _runOperation<T>(
     MssqlCancellationToken? token,
-    Future<T> Function(_OperationContext context) action,
+    Future<T> Function(OperationContext context) action,
   ) async {
     final context = await _beginOperation(token);
     try {
       return await action(context);
     } catch (_) {
-      token?.throwIfCancelled();
+      mssqlThrowIfCancelled(token);
       rethrow;
     } finally {
       _endOperation(context);
     }
   }
 
-  Future<_OperationContext> _beginOperation(
+  Future<OperationContext> _beginOperation(
     MssqlCancellationToken? token,
   ) async {
     final lease = await _operationGate.acquire(token);
@@ -2198,11 +1955,11 @@ ORDER BY c.column_id;
     _activeOperationId = id;
     void Function()? unregister;
     try {
-      unregister = token?.register(() {
+      unregister = mssqlRegisterCancellation(token, () {
         if (_activeOperationId == id && !_closed) _worker.cancel();
       });
-      token?.throwIfCancelled();
-      return _OperationContext(id, lease, unregister);
+      mssqlThrowIfCancelled(token);
+      return OperationContext(id, lease, unregister);
     } catch (_) {
       unregister?.call();
       if (_activeOperationId == id) _activeOperationId = null;
@@ -2211,7 +1968,7 @@ ORDER BY c.column_id;
     }
   }
 
-  void _endOperation(_OperationContext context) {
+  void _endOperation(OperationContext context) {
     context.unregisterCancellation?.call();
     if (_activeOperationId == context.id) _activeOperationId = null;
     context.lease.release();
@@ -2233,7 +1990,7 @@ ORDER BY c.column_id;
     }
   }
 
-  Future<void> closeForRuntimeShutdown() async {
+  Future<void> _closeForRuntimeShutdown() async {
     if (_closed) return;
     _worker.cancel();
     _leasedByTransaction = false;
@@ -2254,7 +2011,8 @@ ORDER BY c.column_id;
       await _worker.close();
     } finally {
       _closed = true;
-      _runtime.unregisterConnection(this);
+      mssqlUnregisterConnection(_runtime, this);
+      _notifyConnectionClose();
     }
   }
 
@@ -2296,23 +2054,24 @@ ORDER BY c.column_id;
     try {
       await _worker.close();
     } catch (_) {}
-    _runtime.ensureCanOpenConnection();
+    mssqlEnsureCanOpenConnection(_runtime);
     try {
       _worker = await ConnectionWorker.open(
         config.copyWith(database: _databaseName),
         _runtime.sybdbPath,
-        _runtime.handlersPath,
+        mssqlRuntimeHandlersPath(_runtime),
       );
       _databaseName = _worker.databaseName;
       invalidateMetadata();
     } catch (_) {
       _closed = true;
-      _runtime.unregisterConnection(this);
+      mssqlUnregisterConnection(_runtime, this);
+      _notifyConnectionClose();
       rethrow;
     }
-    if (sessionSetup.isNotEmpty) {
+    if (_sessionSetup.isNotEmpty) {
       await _executeUnlocked(
-        command: sessionSetup.join('; '),
+        command: _sessionSetup.join('; '),
         procedure: false,
         parameters: const <MssqlParameterBinding>[],
         timeout: null,
@@ -2324,30 +2083,43 @@ ORDER BY c.column_id;
         queryName: _sessionSetupQueryName,
       );
     }
+    _repairCount++;
   }
 
-  Future<T> runTransactionNative<T>(Future<T> Function() action) =>
+  void _notifyConnectionClose() {
+    if (_closeObserved) return;
+    _closeObserved = true;
+    _observationDispatcher.connectionClose(
+      MssqlConnectionCloseEvent(
+        connectionId: connectionId,
+        poolId: _observationDispatcher.poolId,
+        target: _observationTarget,
+        lifetime: _lifetime.elapsed,
+        repairCount: _repairCount,
+      ),
+    );
+  }
+
+  Future<T> _runTransactionNative<T>(Future<T> Function() action) =>
       _runOperation<T>(null, (_) async {
         _ensureAvailable(allowTransaction: true);
         return action();
       });
 
-  void releaseTransactionLease() => _leasedByTransaction = false;
-
   /// Gives the connection back after a transaction has finished with it.
   ///
   /// Restoring whatever the transaction changed about the session is part of
-  /// giving it back, so this is a future: see [restoreSessionBaseline].
-  Future<void> releaseAfterTransaction() async {
+  /// giving it back, so this is a future: see [_restoreSessionBaseline].
+  Future<void> _releaseAfterTransaction() async {
     _leasedByTransaction = false;
-    await restoreSessionBaseline();
+    await _restoreSessionBaseline();
   }
 
   /// Restores reusable session state without replacing an earlier error.
   ///
   /// A failed restore marks the session dirty instead of throwing, preventing
   /// the pool from leasing it again.
-  Future<void> restoreSessionBaseline() async {
+  Future<void> _restoreSessionBaseline() async {
     if (isClosed || !_sessionState.needsRestore) return;
     final statements = _sessionState.restoreStatements();
     if (statements.isEmpty) return;
@@ -2370,9 +2142,9 @@ ORDER BY c.column_id;
   /// server saying so. The session is asked for its own transaction depth, and
   /// only a session that cannot answer, or that still holds an open
   /// transaction, is discarded.
-  Future<void> settleAfterFailedRollback() async {
+  Future<void> _settleAfterFailedRollback() async {
     try {
-      final result = await executeWithinTransaction(
+      final result = await _executeWithinTransaction(
         'SELECT @@TRANCOUNT AS open_transactions;',
         options: const MssqlQueryOptions(
           maximumRows: 2,
@@ -2387,196 +2159,18 @@ ORDER BY c.column_id;
     } catch (_) {
       // Fall through: a session that cannot be inspected cannot be trusted.
     }
-    await discardAfterTransactionFailure();
+    await _discardAfterTransactionFailure();
   }
 
   /// Drops a connection whose transaction state could not be resolved.
   ///
   /// A rollback that failed leaves the session ambiguous, so the lease is
   /// released and the worker is torn down instead of being reused or pooled.
-  Future<void> discardAfterTransactionFailure() async {
+  Future<void> _discardAfterTransactionFailure() async {
     _leasedByTransaction = false;
     try {
       await close();
     } catch (_) {}
-  }
-
-  static bool _isSingleByteText(MssqlType type) =>
-      type == MssqlType.char ||
-      type == MssqlType.varchar ||
-      type == MssqlType.text;
-
-  static int _decodedRowBytes(List<Object?> row) {
-    var bytes = 0;
-    for (final value in row) {
-      bytes += switch (value) {
-        null => 0,
-        final String text => text.length * 2,
-        final Uint8List data => data.length,
-        final bool _ => 1,
-        _ => 8,
-      };
-    }
-    return bytes;
-  }
-
-  static void _validateBulkKeys(
-    Map<String, Object?> row,
-    List<String> selected,
-    int rowIndex,
-  ) {
-    if (row.length == selected.length && selected.every(row.containsKey)) {
-      return;
-    }
-    final selectedSet = selected.toSet();
-    final missing = selected.where((name) => !row.containsKey(name)).toList();
-    final extra = row.keys
-        .where((name) => !selectedSet.contains(name))
-        .toList();
-    final column = missing.isNotEmpty
-        ? missing.first
-        : (extra.isNotEmpty ? extra.first : '<row>');
-    throw MssqlBulkRowException(
-      rowIndex: rowIndex,
-      columnName: column,
-      detail: missing.isNotEmpty
-          ? 'the selected column is missing.'
-          : 'the row contains a column outside the selected set.',
-    );
-  }
-
-  static MssqlValue _bulkValue(
-    Object? raw,
-    MssqlBulkColumn column,
-    int rowIndex,
-  ) {
-    try {
-      final value = raw is MssqlParameter
-          ? (raw..validate()).toValue()
-          : raw is MssqlValue
-          ? raw.validated()
-          : coerceMssqlValue(
-              raw,
-              type: column.type,
-              size: column.size,
-              precision: column.precision,
-              scale: column.scale,
-            );
-      if (value.type != column.type) {
-        throw StateError('explicit value type does not match destination');
-      }
-      if (value.value == null && !column.nullable) {
-        throw StateError('NULL is not allowed');
-      }
-      return value;
-    } catch (_) {
-      throw MssqlBulkRowException(
-        rowIndex: rowIndex,
-        columnName: column.name,
-        detail:
-            'expected ${column.type}; received ${raw is MssqlParameter
-                ? raw.type
-                : raw is MssqlValue
-                ? raw.type
-                : raw?.runtimeType ?? 'NULL'}.',
-      );
-    }
-  }
-
-  static void _validateRawBulkColumns(List<MssqlBulkColumn> columns) {
-    if (columns.isEmpty) {
-      throw ArgumentError('At least one bulk column is required.');
-    }
-    final ordinals = <int>{};
-    final names = <String>{};
-    for (final column in columns) {
-      column.validate();
-      if (!ordinals.add(column.ordinal)) {
-        throw ArgumentError('Bulk column ordinals must be unique.');
-      }
-      if (!names.add(column.name)) {
-        throw ArgumentError('Bulk column names must be unique.');
-      }
-    }
-  }
-
-  static MssqlType _typeFromSqlName(String name) => switch (name
-      .toLowerCase()) {
-    'bit' => MssqlType.bit,
-    'tinyint' => MssqlType.tinyInt,
-    'smallint' => MssqlType.smallInt,
-    'int' => MssqlType.int32,
-    'bigint' => MssqlType.int64,
-    'real' => MssqlType.real,
-    'float' => MssqlType.float64,
-    'decimal' => MssqlType.decimal,
-    'numeric' => MssqlType.numeric,
-    'money' => MssqlType.money,
-    'smallmoney' => MssqlType.smallMoney,
-    'char' => MssqlType.char,
-    'varchar' => MssqlType.varchar,
-    'nchar' => MssqlType.nchar,
-    'nvarchar' || 'sysname' => MssqlType.nvarchar,
-    'text' => MssqlType.text,
-    'ntext' => MssqlType.ntext,
-    'binary' => MssqlType.binary,
-    'varbinary' => MssqlType.varbinary,
-    'image' => MssqlType.image,
-    'date' => MssqlType.date,
-    'time' => MssqlType.time,
-    'smalldatetime' => MssqlType.smallDateTime,
-    'datetime' => MssqlType.dateTime,
-    'datetime2' => MssqlType.dateTime2,
-    'datetimeoffset' => MssqlType.dateTimeOffset,
-    'uniqueidentifier' => MssqlType.uniqueIdentifier,
-    'xml' => MssqlType.xml,
-    final unsupported => throw MssqlException(
-      type: MssqlErrorType.unsupportedType,
-      message: 'SQL type "$unsupported" is not supported by this operation.',
-    ),
-  };
-
-  static int _metadataSize(MssqlType type, int maxLength) {
-    if (maxLength < 0) return 0;
-    if (type == MssqlType.nchar || type == MssqlType.nvarchar) {
-      return maxLength ~/ 2;
-    }
-    return maxLength;
-  }
-
-  static String _tdsVersionName(int code) => switch (code) {
-    1 => '2.0',
-    2 => '3.4',
-    3 => '4.0',
-    4 => '4.2',
-    5 => '4.6',
-    6 => '4.9.5',
-    7 => '5.0',
-    8 => '7.0',
-    9 => '7.1',
-    10 => '7.2',
-    11 => '7.3',
-    12 => '7.4',
-    13 => '8.0',
-    _ => 'unknown($code)',
-  };
-
-  static void _validateQueryLimits(
-    String sql, {
-    required int batchRows,
-    required int maximumRows,
-    required int maximumBytes,
-    required Duration? timeout,
-  }) {
-    if (sql.trim().isEmpty) throw ArgumentError.value(sql, 'sql');
-    if (batchRows < 1 || batchRows > 1000) {
-      throw RangeError.range(batchRows, 1, 1000, 'batchRows');
-    }
-    if (maximumRows < 0) throw RangeError.value(maximumRows, 'maximumRows');
-    if (maximumBytes < 0) throw RangeError.value(maximumBytes, 'maximumBytes');
-    if (timeout != null && timeout <= Duration.zero) {
-      throw ArgumentError.value(timeout, 'timeout');
-    }
   }
 
   void _ensureAvailable({bool allowTransaction = false}) {
@@ -2591,3 +2185,171 @@ ORDER BY c.column_id;
     }
   }
 }
+
+/// Package-internal entry points used by pool and transaction wrappers.
+///
+/// These remain explicit arguments rather than ambient Zone state. They are
+/// hidden from the package export with `show MssqlConnection`.
+Future<MssqlConnection> mssqlOpenPooledConnection(
+  MssqlConnectionConfig config, {
+  required MssqlMetadataCache metadataCache,
+  required MssqlObservationDispatcher dispatcher,
+}) => MssqlConnection._open(
+  config,
+  metadataCache: metadataCache,
+  observationDispatcher: dispatcher,
+);
+
+MssqlQueryObservation? mssqlStartConnectionQueryObservation(
+  MssqlConnection connection, {
+  required MssqlQueryKind kind,
+  required String? queryName,
+  required bool inTransaction,
+  required int? transactionId,
+}) => connection._observationDispatcher.startQuery(
+  kind: kind,
+  queryName: queryName,
+  target: connection._observationTarget,
+  inTransaction: inTransaction,
+  connectionId: connection.connectionId,
+  transactionId: transactionId,
+);
+
+Future<MssqlExecutionResult> mssqlRunDelegatedQuery(
+  MssqlConnection connection, {
+  required MssqlQueryObservation? observation,
+  required String sql,
+  required Object parameters,
+  required MssqlQueryOptions options,
+  required bool allowTransaction,
+}) => connection._runObservedQuery(
+  observation,
+  () => connection._queryCore(
+    sql,
+    parameters: parameters,
+    options: options,
+    allowTransaction: allowTransaction,
+  ),
+  retryAllowed: options.retry != MssqlRetryPolicy.never,
+);
+
+Future<MssqlExecutionResult> mssqlRunDelegatedProcedure(
+  MssqlConnection connection, {
+  required MssqlQueryObservation? observation,
+  required String procedure,
+  required Object parameters,
+  required Set<String> outputParameters,
+  required MssqlQueryOptions options,
+  required MssqlProcedureMetadata? declared,
+  required MssqlMetadataDriftPolicy driftPolicy,
+  required bool allowTransaction,
+}) => connection._runObservedQuery(
+  observation,
+  () => connection._callProcedureCore(
+    procedure,
+    parameters: parameters,
+    outputParameters: outputParameters,
+    options: options,
+    declared: declared,
+    driftPolicy: driftPolicy,
+    allowTransaction: allowTransaction,
+  ),
+);
+
+Stream<MssqlStreamEvent> mssqlRunDelegatedStream(
+  MssqlConnection connection, {
+  required MssqlQueryObservation? observation,
+  required String sql,
+  required Object parameters,
+  required MssqlQueryOptions options,
+  required bool allowTransaction,
+}) => connection._observedStream(
+  kind: MssqlQueryKind.stream,
+  queryName: options.queryName,
+  inTransaction: allowTransaction,
+  transactionId: observation?.transactionId,
+  delegatedObservation: observation,
+  create: () => connection._streamCore(
+    sql,
+    parameters: parameters,
+    options: options,
+    allowTransaction: allowTransaction,
+  ),
+);
+
+MssqlBulkObservation? mssqlStartConnectionBulkObservation(
+  MssqlConnection connection, {
+  required String? bulkName,
+  required bool inTransaction,
+  required int? transactionId,
+}) => connection._observationDispatcher.startBulk(
+  bulkName: bulkName,
+  target: connection._observationTarget,
+  inTransaction: inTransaction,
+  connectionId: connection.connectionId,
+  transactionId: transactionId,
+);
+
+Future<MssqlBulkResult> mssqlRunDelegatedBulk(
+  MssqlConnection connection, {
+  required MssqlBulkObservation? observation,
+  required String tableName,
+  required Iterable<Object> rows,
+  required Object? columns,
+  required MssqlBulkOptions options,
+  required MssqlCancellationToken? cancellationToken,
+  required void Function(int sentRows)? onProgress,
+  required bool allowTransaction,
+}) => connection._runObservedBulk(
+  observation,
+  () => connection._bulkInsertCore(
+    tableName: tableName,
+    rows: rows,
+    columns: columns,
+    options: options,
+    cancellationToken: cancellationToken,
+    onProgress: onProgress,
+    allowTransaction: allowTransaction,
+  ),
+);
+
+Future<MssqlTransaction> mssqlBeginDelegatedTransaction(
+  MssqlConnection connection, {
+  required MssqlIsolationLevel isolationLevel,
+  required MssqlCancellationToken? cancellationToken,
+  required MssqlTransactionObservation? observation,
+}) => connection._beginTransactionCore(
+  isolationLevel: isolationLevel,
+  cancellationToken: cancellationToken,
+  observation: observation,
+);
+
+Future<MssqlExecutionResult> mssqlExecuteWithinTransaction(
+  MssqlConnection connection,
+  String command, {
+  Object parameters = const <String, Object?>{},
+  MssqlQueryOptions options = MssqlQueryOptions.defaults,
+  bool procedure = false,
+}) => connection._executeWithinTransaction(
+  command,
+  parameters: parameters,
+  options: options,
+  procedure: procedure,
+);
+
+Future<T> mssqlRunTransactionNative<T>(
+  MssqlConnection connection,
+  Future<T> Function() action,
+) => connection._runTransactionNative(action);
+
+Future<void> mssqlReleaseAfterTransaction(MssqlConnection connection) =>
+    connection._releaseAfterTransaction();
+
+Future<void> mssqlRestoreSessionBaseline(MssqlConnection connection) =>
+    connection._restoreSessionBaseline();
+
+Future<void> mssqlSettleAfterFailedRollback(MssqlConnection connection) =>
+    connection._settleAfterFailedRollback();
+
+Future<void> mssqlDiscardAfterTransactionFailure(MssqlConnection connection) =>
+    connection._discardAfterTransactionFailure();
