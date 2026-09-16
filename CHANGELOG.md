@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.3
+## 0.1.0
 Add dependency-free observability hooks for queries, streams, bulk copy,
 transactions, connection lifecycle and real pool waits. Events expose safe
 labels, metrics and classified failures without SQL, parameters, credentials or
