@@ -66,7 +66,7 @@ part of the SQL text.
 
 ```yaml
 dependencies:
-  mssql_native: ^0.0.2
+  mssql_native: ^0.1.1
 ```
 
 The build hook packages the native libraries during `dart run`,

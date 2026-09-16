@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+Align the package metadata, Darwin podspec and examples on the published
+package version.
+
 ## 0.1.0
 Add dependency-free observability hooks for queries, streams, bulk copy,
 transactions, connection lifecycle and real pool waits. Events expose safe
