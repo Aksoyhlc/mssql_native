@@ -482,28 +482,48 @@ void _entry(List<Object?> args) {
     return;
   }
 
-  // Session preconditions, not caller policy, so they are applied here rather
-  // than left to MssqlConnection.sessionSetup.
+  // The session baseline, for a fresh login and a reopened connection alike.
   //
   // TEXTSIZE is the one that bites: DB-Library defaults it to 4096 bytes, which
   // silently truncates text/ntext/image and every (max) column read - a 1 MB
   // varbinary comes back as 4 KB with no error at all.
   //
-  // NOCOUNT is left OFF (the server default). SET NOCOUNT ON suppresses the
-  // row-count DONE tokens that bcp_done() and affected-row reporting depend on,
-  // which breaks BCP completion.
+  // NOCOUNT is left OFF and is not configurable: SET NOCOUNT ON suppresses the
+  // row-count DONE tokens that bcp_done() and affected-row reporting depend on.
   try {
-    _runSql(
-      'SET XACT_ABORT ON; SET ANSI_NULLS ON; SET ANSI_WARNINGS ON; '
-      'SET TEXTSIZE 2147483647;',
-      config.loginTimeout,
-    );
+    _runSql(config.sessionOptions.renderSetBatch(), config.loginTimeout);
   } on WorkerFailure catch (failure) {
     _w.handlers.interruptDetach(dbproc);
     lib.dbclose(dbproc);
     send.send(<Object?>[-1, null, failure]);
     _w.handlers.release();
     return;
+  }
+
+  // The caller's own statements, in their own batch: QUOTED_IDENTIFIER takes
+  // effect when a batch is parsed, so anything sharing the batch above would be
+  // parsed under the setting the session had before it.
+  final initBatch = config.sessionOptions.renderInitBatch();
+  if (initBatch != null) {
+    try {
+      _runSql(initBatch, config.loginTimeout);
+    } on WorkerFailure catch (failure) {
+      _w.handlers.interruptDetach(dbproc);
+      lib.dbclose(dbproc);
+      send.send(<Object?>[
+        -1,
+        null,
+        WorkerFailure(
+          failure.code,
+          failure.typeIndex,
+          'sessionOptions.initSql failed at login: ${failure.message}',
+          failure.retryable,
+          failure.diagnostics,
+        ),
+      ]);
+      _w.handlers.release();
+      return;
+    }
   }
 
   // Ready: hand back the command port and the opaque interrupt state. The main

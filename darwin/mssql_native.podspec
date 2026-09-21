@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'mssql_native'
-  s.version          = '0.1.1'
+  s.version          = '0.2.0'
   s.summary          = 'FreeTDS DB-Library and error handlers for the mssql_native Dart driver.'
   s.description      = <<-DESC
 Ships FreeTDS DB-Library and a small C library that owns its global error handlers. The SQL Server driver itself is Dart, calling both through dart:ffi.

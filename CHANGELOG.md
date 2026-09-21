@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+* Fixed SQL Server error 1934 by enabling required session SET options.
+* Breaking: `QUOTED_IDENTIFIER` is now on. Use single quotes for strings or `MssqlSessionOptions.legacy`.
+* Added configurable session defaults via `MssqlSessionOptions`, applied automatically on login and reconnect.
+
+
 ## 0.1.1
 Align the package metadata, Darwin podspec and examples on the published
 package version.

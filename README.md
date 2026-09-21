@@ -54,6 +54,7 @@ part of the SQL text.
 - [Stored procedures](#stored-procedures)
 - [Bulk copy](#bulk-copy)
 - [Encryption and certificate trust](#encryption-and-certificate-trust)
+- [Session options](#session-options)
 - [Execution settings](#execution-settings)
 - [Error handling](#error-handling)
 - [Observability](#observability)
@@ -66,7 +67,7 @@ part of the SQL text.
 
 ```yaml
 dependencies:
-  mssql_native: ^0.1.1
+  mssql_native: ^0.2.0
 ```
 
 The build hook packages the native libraries during `dart run`,
@@ -556,6 +557,26 @@ encryption nor certificate verification. See
 line.** A `WHERE` clause with a literal in it, or a password on its way into a
 users table, becomes a secret the moment it is logged. Label a statement with
 `MssqlQueryOptions(queryName: …)` and the label is what appears instead.
+
+## Session options
+
+The SET options a session logs in with are one object: the ANSI options, the
+isolation level, `TEXTSIZE`, `LOCK_TIMEOUT` and `DEADLOCK_PRIORITY`. They are
+applied at login, and again whenever the driver reopens a broken connection.
+
+```dart
+MssqlConnectionConfig(
+  // ...
+  sessionOptions: MssqlSessionOptions(
+    isolation: MssqlIsolationLevel.snapshot,
+    lockTimeout: Duration(seconds: 5),
+  ),
+);
+```
+
+`initSql` runs statements of your own after them, for a setting the class does
+not name. `MssqlSessionOptions.legacy` restores the pre-0.2.0 behaviour, where
+`"..."` delimits a string rather than an identifier.
 
 ## Execution settings
 

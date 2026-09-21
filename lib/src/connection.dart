@@ -39,7 +39,10 @@ class MssqlConnection with MssqlSession {
        _observationDispatcher = observationDispatcher,
        connectionId = MssqlObservationDispatcher.newConnectionId(),
        _lifetime = Stopwatch()..start(),
-       _sessionState = MssqlSessionState(baselineDatabase: config.database),
+       _sessionState = MssqlSessionState(
+         baselineDatabase: config.database,
+         baselineIsolation: config.sessionOptions.isolation,
+       ),
        _metadataCache =
            metadataCache ??
            MssqlMetadataCache(
@@ -127,15 +130,6 @@ class MssqlConnection with MssqlSession {
     }
     _databaseCodePageCache = null;
   }
-
-  /// What every session is set to at login and returned to before reuse.
-  ///
-  /// The isolation level is set here rather than left to the server, so it is
-  /// the driver's contract rather than whoever held the connection last.
-  static final List<String> _sessionSetup = <String>[
-    'SET ARITHABORT ON',
-    MssqlSessionState.isolationSql(MssqlSessionState.baselineIsolation),
-  ];
 
   /// Opens a connection from the required settings and standard defaults.
   static Future<MssqlConnection> connect({
@@ -259,7 +253,6 @@ class MssqlConnection with MssqlSession {
         metadataCache: metadataCache,
         observationDispatcher: observationDispatcher,
       );
-      await connection._applySessionSetup();
       mssqlRegisterConnection(
         runtime,
         connection,
@@ -287,28 +280,6 @@ class MssqlConnection with MssqlSession {
       mssqlEndConnectionOpen(runtime);
     }
   }
-
-  Future<void> _applySessionSetup() async {
-    if (_sessionSetup.isEmpty) return;
-    await _runOperation<void>(null, (context) async {
-      await _executeUnlocked(
-        command: _sessionSetup.join('; '),
-        procedure: false,
-        parameters: const <MssqlParameterBinding>[],
-        timeout: null,
-        batchRows: 1,
-        maximumRows: 0,
-        maximumBytes: 0,
-        queueWait: context.lease.queueWait,
-        allowTransaction: true,
-        queryName: _sessionSetupQueryName,
-      );
-    });
-  }
-
-  /// The label the driver's own statements carry in a failure, so a caller can
-  /// tell their query from the login-time SET batch or a metadata lookup.
-  static const String _sessionSetupQueryName = 'mssql_native.sessionSetup';
 
   /// [allowTransaction] is for the transaction handle holding this
   /// connection; see [bulkInsert].
@@ -1156,7 +1127,7 @@ class MssqlConnection with MssqlSession {
         // rollback and close all have the same thing to put back.
         final previous = _sessionState.isolation;
         final wanted = isolationLevel == MssqlIsolationLevel.baseline
-            ? MssqlSessionState.baselineIsolation
+            ? _sessionState.baselineIsolation
             : isolationLevel;
         try {
           final prelude = wanted == previous
@@ -2069,20 +2040,7 @@ SELECT
       _notifyConnectionClose();
       rethrow;
     }
-    if (_sessionSetup.isNotEmpty) {
-      await _executeUnlocked(
-        command: _sessionSetup.join('; '),
-        procedure: false,
-        parameters: const <MssqlParameterBinding>[],
-        timeout: null,
-        batchRows: 1,
-        maximumRows: 0,
-        maximumBytes: 0,
-        queueWait: Duration.zero,
-        allowTransaction: true,
-        queryName: _sessionSetupQueryName,
-      );
-    }
+    // The reopened worker applies the session options as part of its login.
     _repairCount++;
   }
 

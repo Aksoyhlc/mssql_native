@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:meta/meta.dart';
 
+import 'session_options.dart';
 import 'types.dart';
 
 /// The driver's default connection settings.
@@ -54,6 +55,9 @@ abstract final class MssqlDefaults {
   /// How `DECIMAL`, `NUMERIC` and `MONEY` reach Dart.
   static const MssqlDecimalMode decimalMode = MssqlDecimalMode.exact;
 
+  /// The SET options every session is logged in with.
+  static const MssqlSessionOptions sessionOptions = MssqlSessionOptions.ansi;
+
   /// Connections opened before the pool is asked for one.
   static const int poolMinimumSize = 0;
 
@@ -99,6 +103,7 @@ class MssqlConnectionConfig {
     this.decimalMode = MssqlDefaults.decimalMode,
     this.metadataCacheSize = MssqlDefaults.metadataCacheSize,
     this.metadataCacheTtl = MssqlDefaults.metadataCacheTtl,
+    this.sessionOptions = MssqlDefaults.sessionOptions,
     this.integratedSecurity = false,
   });
 
@@ -118,6 +123,7 @@ class MssqlConnectionConfig {
     this.decimalMode = MssqlDefaults.decimalMode,
     this.metadataCacheSize = MssqlDefaults.metadataCacheSize,
     this.metadataCacheTtl = MssqlDefaults.metadataCacheTtl,
+    this.sessionOptions = MssqlDefaults.sessionOptions,
   }) : username = '',
        password = '',
        integratedSecurity = true;
@@ -173,6 +179,9 @@ class MssqlConnectionConfig {
   /// process restart.
   final Duration metadataCacheTtl;
 
+  /// The SET options this connection is logged in with.
+  final MssqlSessionOptions sessionOptions;
+
   /// Reads a .NET-style connection string.
   ///
   /// ```dart
@@ -190,6 +199,7 @@ class MssqlConnectionConfig {
   factory MssqlConnectionConfig.fromConnectionString(
     String connectionString, {
     MssqlDecimalMode decimalMode = MssqlDefaults.decimalMode,
+    MssqlSessionOptions sessionOptions = MssqlDefaults.sessionOptions,
     void Function(List<String> keys)? onUnsupportedKeys,
   }) {
     final values = _parseConnectionString(connectionString);
@@ -314,6 +324,7 @@ class MssqlConnectionConfig {
       loginTimeout: loginTimeout,
       encryption: encryption,
       decimalMode: decimalMode,
+      sessionOptions: sessionOptions,
     );
   }
 
@@ -337,6 +348,7 @@ class MssqlConnectionConfig {
     MssqlDecimalMode? decimalMode,
     int? metadataCacheSize,
     Duration? metadataCacheTtl,
+    MssqlSessionOptions? sessionOptions,
     bool? integratedSecurity,
   }) {
     final integrated = integratedSecurity ?? this.integratedSecurity;
@@ -362,6 +374,7 @@ class MssqlConnectionConfig {
         decimalMode: decimalMode ?? this.decimalMode,
         metadataCacheSize: metadataCacheSize ?? this.metadataCacheSize,
         metadataCacheTtl: metadataCacheTtl ?? this.metadataCacheTtl,
+        sessionOptions: sessionOptions ?? this.sessionOptions,
       );
     }
     return MssqlConnectionConfig(
@@ -380,10 +393,12 @@ class MssqlConnectionConfig {
       decimalMode: decimalMode ?? this.decimalMode,
       metadataCacheSize: metadataCacheSize ?? this.metadataCacheSize,
       metadataCacheTtl: metadataCacheTtl ?? this.metadataCacheTtl,
+      sessionOptions: sessionOptions ?? this.sessionOptions,
     );
   }
 
   void validate() {
+    sessionOptions.validate();
     if (host.trim().isEmpty) throw ArgumentError.value(host, 'host');
     if (database.trim().isEmpty) {
       throw ArgumentError.value(database, 'database');

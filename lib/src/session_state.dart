@@ -8,20 +8,28 @@ import 'models/types.dart';
 /// undo exactly; anything a caller changed through raw SQL is invisible and
 /// marks the session dirty, so the pool discards it rather than handing it on.
 class MssqlSessionState {
-  MssqlSessionState({required this.baselineDatabase});
+  MssqlSessionState({
+    required this.baselineDatabase,
+    MssqlIsolationLevel baselineIsolation = defaultIsolation,
+  }) : baselineIsolation = baselineIsolation == MssqlIsolationLevel.baseline
+           ? defaultIsolation
+           : baselineIsolation,
+       _isolation = baselineIsolation == MssqlIsolationLevel.baseline
+           ? defaultIsolation
+           : baselineIsolation;
 
-  /// The isolation level every session starts and returns to.
-  ///
-  /// Stated explicitly rather than left to the server, so it is a property of
-  /// the driver's contract. This does not opt out of a database's
-  /// READ_COMMITTED_SNAPSHOT setting.
-  static const MssqlIsolationLevel baselineIsolation =
+  /// The isolation level a session starts and returns to unless the
+  /// configuration names another one.
+  static const MssqlIsolationLevel defaultIsolation =
       MssqlIsolationLevel.readCommitted;
 
   /// The database the connection logged in to, or null when it was not stated.
   final String? baselineDatabase;
 
-  MssqlIsolationLevel _isolation = baselineIsolation;
+  /// The isolation level this session starts and returns to.
+  final MssqlIsolationLevel baselineIsolation;
+
+  MssqlIsolationLevel _isolation;
   String? _database;
   final Set<String> _setOptions = <String>{};
   String? _dirtyReason;
@@ -102,7 +110,7 @@ class MssqlSessionState {
   /// [MssqlIsolationLevel.baseline] emits a real statement: sending nothing
   /// would let one caller's choice become the next caller's default.
   static String isolationSql(MssqlIsolationLevel level) => switch (level) {
-    MssqlIsolationLevel.baseline => isolationSql(baselineIsolation),
+    MssqlIsolationLevel.baseline => isolationSql(defaultIsolation),
     MssqlIsolationLevel.readUncommitted =>
       'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;',
     MssqlIsolationLevel.readCommitted =>

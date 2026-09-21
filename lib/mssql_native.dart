@@ -54,6 +54,8 @@ export 'src/models/result.dart'
         MssqlServerInfo,
         MssqlServerMessage,
         MssqlStreamEvent;
+export 'src/models/session_options.dart'
+    show MssqlDeadlockPriority, MssqlSessionOptions;
 export 'src/models/types.dart'
     show
         MssqlBulkMode,

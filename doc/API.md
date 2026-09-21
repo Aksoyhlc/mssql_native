@@ -94,6 +94,7 @@ Every default lives in `MssqlDefaults` and nowhere else, so the answer to
 | `defaultQueryTimeout` | 30 seconds, overridable per operation |
 | `decimalMode` | `MssqlDecimalMode.exact` |
 | `encryption` | `MssqlEncryption.off` |
+| `sessionOptions` | `MssqlSessionOptions.ansi` |
 | Certificate trust | none until `initialize(tls: ...)` says so |
 | Retry | `MssqlRetryPolicy.never` |
 | Pool | min 0, max 2, acquire 15s, idle 5min, grace 0 |
